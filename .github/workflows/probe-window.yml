@@ -35,7 +35,7 @@ env:
   # human checkpoint (40-CONTEXT.md D-18), never pre-guessed from documentation.
   # --standalone is locked project-wide; the single-executable bundling mode is
   # never used, in this workflow or anywhere else in this phase.
-  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent"
+  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy"
   # A deliberately invalid bearer token, planted into config.json before every
   # launch below. The program must reach its own authorization-failure path and
   # stop there — this value is never a real token and is never sent anywhere

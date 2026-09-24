@@ -198,6 +198,57 @@ Write-Host "DurationSeconds: $DurationSeconds"
 # BEFORE snapshot
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# AMBIENT CONTROL WINDOW -- measured BEFORE the agent is launched
+# ---------------------------------------------------------------------------
+#
+# This script cannot attribute a filesystem write to a process: it diffs whole
+# directory trees, and it deliberately refuses to install a kernel-mode driver
+# (Procmon/Sysmon) to get real per-process attribution -- driver installability
+# on a hosted runner is UNKNOWN (40-RESEARCH.md Pitfall 6 / Assumption A5).
+#
+# Without a control, EVERY write that Windows, .NET, Defender, the PowerShell
+# host or the CI runner itself makes to TEMP/APPDATA/LOCALAPPDATA during the
+# observation window is charged to the agent, and Fact 3 reports False for a
+# perfectly well-behaved program. That is not a hypothetical: probe runs #1-#3
+# all reported Fact 3 False, every one of them against a process that had
+# already died -- a process that cannot write anything at all.
+#
+# So: run the identical snapshot/diff over an equal-length window with NO agent
+# running, and treat those paths as the machine's noise floor. A path is only
+# charged to the agent if it changed during the agent's window AND did not
+# change during the control window. This is still not true attribution -- it
+# cannot be, without a driver -- so the violating paths are printed in full and
+# the noise floor is reported alongside, for a human to adjudicate. Fact 3 is
+# evidence to read, never a verdict to accept unseen.
+
+$controlStartAppData = Get-WatchedRootSnapshot -RootPath $env:APPDATA -Recurse $true
+$controlStartLocalAppData = Get-WatchedRootSnapshot -RootPath $localAppDataDir -Recurse $true
+$controlStartTemp = Get-WatchedRootSnapshot -RootPath $tempDir -Recurse $true
+$controlStartUserProfile = Get-WatchedRootSnapshot -RootPath $userProfileDir -Recurse $false
+
+Write-Host "Measuring ambient filesystem noise for $DurationSeconds seconds (no agent running)..."
+Start-Sleep -Seconds $DurationSeconds
+
+$controlEndAppData = Get-WatchedRootSnapshot -RootPath $env:APPDATA -Recurse $true
+$controlEndLocalAppData = Get-WatchedRootSnapshot -RootPath $localAppDataDir -Recurse $true
+$controlEndTemp = Get-WatchedRootSnapshot -RootPath $tempDir -Recurse $true
+$controlEndUserProfile = Get-WatchedRootSnapshot -RootPath $userProfileDir -Recurse $false
+
+$ambientChangedPaths = @()
+$ambientChangedPaths += Get-ChangedPaths -Before $controlStartAppData -After $controlEndAppData
+$ambientChangedPaths += Get-ChangedPaths -Before $controlStartLocalAppData -After $controlEndLocalAppData
+$ambientChangedPaths += Get-ChangedPaths -Before $controlStartTemp -After $controlEndTemp
+$ambientChangedPaths += Get-ChangedPaths -Before $controlStartUserProfile -After $controlEndUserProfile
+
+$ambientPathSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($ambientPath in $ambientChangedPaths) { [void]$ambientPathSet.Add($ambientPath) }
+Write-Host "Ambient noise floor: $($ambientPathSet.Count) path(s) changed with no agent running."
+
+# ---------------------------------------------------------------------------
+# The agent's own observation window starts here
+# ---------------------------------------------------------------------------
+
 $beforeAppData = Get-WatchedRootSnapshot -RootPath $env:APPDATA -Recurse $true
 $beforeLocalAppData = Get-WatchedRootSnapshot -RootPath $localAppDataDir -Recurse $true
 $beforeTemp = Get-WatchedRootSnapshot -RootPath $tempDir -Recurse $true
@@ -298,7 +349,14 @@ $changedTemp = $changedTemp | Where-Object { $_ -ne $stdoutLogPath -and $_ -ne $
 $allChangedPaths = @($changedAppData) + @($changedLocalAppData) + @($changedTemp) + @($changedUserProfile)
 $appDataAgentPrefix = $appDataDir + [System.IO.Path]::DirectorySeparatorChar
 
-$filesystemViolations = $allChangedPaths | Where-Object { -not $_.StartsWith($appDataAgentPrefix, [System.StringComparison]::OrdinalIgnoreCase) }
+$outsideOwnFolderPaths = $allChangedPaths | Where-Object { -not $_.StartsWith($appDataAgentPrefix, [System.StringComparison]::OrdinalIgnoreCase) }
+
+# Subtract the machine's measured noise floor. A path that also changed during
+# the control window -- when no agent was running -- cannot be evidence about
+# the agent. See the ambient-control block above for why this is necessary and
+# why it is still not true per-process attribution.
+$filesystemViolations = $outsideOwnFolderPaths | Where-Object { -not $ambientPathSet.Contains($_) }
+$ambientSuppressedPaths = $outsideOwnFolderPaths | Where-Object { $ambientPathSet.Contains($_) }
 
 # ---------------------------------------------------------------------------
 # Fact 2 -- resolve the base-url host and classify every observed remote address
@@ -372,8 +430,12 @@ $result = [ordered]@{
             violatingAddresses       = @($violatingOutboundAddresses)
         }
         filesystemWrites = [ordered]@{
-            violatingPaths = @($filesystemViolations)
-            allChangedPaths = @($allChangedPaths)
+            violatingPaths           = @($filesystemViolations)
+            allChangedPaths          = @($allChangedPaths)
+            outsideOwnFolderPaths    = @($outsideOwnFolderPaths)
+            ambientNoiseFloorPaths   = @($ambientPathSet)
+            ambientSuppressedPaths   = @($ambientSuppressedPaths)
+            attributionNote          = "This script diffs directory trees; it cannot attribute a write to a process. Paths that also changed during an equal-length control window with no agent running are subtracted as machine noise. Read violatingPaths before believing Fact 3 either way."
         }
     }
     diagnostic = [ordered]@{
@@ -393,6 +455,16 @@ Write-Host "=== D-17 runtime observation result ==="
 Write-Host "Fact 1 (no listening port):         $noListeningPortHeld"
 Write-Host "Fact 2 (outbound only to base_url):  $outboundOnlyToBaseUrlHeld"
 Write-Host "Fact 3 (writes only in own folder):  $writesOnlyInOwnFolderHeld"
+Write-Host "    ambient noise floor: $($ambientPathSet.Count) path(s); suppressed as noise: $(@($ambientSuppressedPaths).Count)"
+if (@($filesystemViolations).Count -gt 0) {
+    Write-Host "    Fact 3 charged these path(s) to the agent -- inspect before treating as a finding:"
+    foreach ($violation in $filesystemViolations) { Write-Host "      $violation" }
+}
+if ($proc.HasExited -and $null -ne $exitCode -and $exitCode -ne 0) {
+    Write-Host "    WARNING: the observed process exited with $exitCode. All three facts above are"
+    Write-Host "    measurements of a process that was not running normally, and none of them is"
+    Write-Host "    evidence about the shipped program until it is re-measured on a healthy build."
+}
 Write-Host "ALL FACTS HELD:                      $allFactsHeld"
 Write-Host "Process exit code: $exitCode (HasExited=$($proc.HasExited))"
 Write-Host "--- DIAGNOSTIC (not used for any fact above) ---"

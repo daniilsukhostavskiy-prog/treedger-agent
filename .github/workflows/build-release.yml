@@ -25,7 +25,7 @@ env:
   # failure on real build output, never pre-guessed. --standalone is locked
   # project-wide; the single-executable bundling mode is never used anywhere
   # in this workflow.
-  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent"
+  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy"
   # A deliberately invalid bearer token, planted into config.json before the
   # runtime-observation launch below. The program must reach its own
   # authorization-failure path and stop there — this value is never a real
