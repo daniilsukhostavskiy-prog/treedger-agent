@@ -2,12 +2,12 @@
 agent/mt5_bridge.py — the ONLY module in this package that imports MetaTrader5.
 
 A stripped PORT of `mt5-service/services/mt5_bridge.py` (the donor stays in the tree
-untouched as a working reference — PHASE-LOCAL-SYNC-SPEC.md §9). Unlike the donor,
+untouched as a working reference). Unlike the donor,
 this module is SYNCHRONOUS: the donor's async/await + `_run()`/`_mt5_lock` machinery
 exists to serialise many concurrent asyncio tasks sharing one FastAPI event loop and
 one always-on terminal across many users. This program has exactly one user driving
 one terminal, walking one account at a time from a single-threaded loop (or a single
-background worker thread, in the GUI a later plan adds) — there is no concurrent
+background worker thread, in the GUI `agent/main.py` provides) — there is no concurrent
 caller to serialise against, so no lock of any kind is needed here.
 
 Brought across from the donor, verbatim in rule where noted below:
@@ -27,14 +27,15 @@ Brought across from the donor, verbatim in rule where noted below:
 - `detect_broker_utc_offset_seconds()` and its `UtcOffsetResult` shape.
 - `login_account()`'s credential-handling discipline — `password` is never logged,
   never included in an exception message, never written to a file.
-- `current_logged_in_account()` — called immediately after `initialize_terminal()`,
-  this is 39-CONTEXT.md D-23's input: if a session was already active when this
+- `current_logged_in_account()` — called immediately after `initialize_terminal()`:
+  if a session was already active when this
   program attached, the caller pins a persistent notice for the rest of the run.
 - `initialize_terminal(path)` / `shutdown_terminal()` — the path comes from
   `agent.terminal_discovery.find_terminal_path()`, never a config file or an
-  environment variable (39-CONTEXT.md §8 / D-09 §12.2).
+  environment variable — there is no configuration option to point this program
+  at a path manually, by design.
 
-Deliberately NOT brought across, and why (39-PATTERNS.md's explicit exclusion list):
+Deliberately NOT brought across, and why:
 - The two-lock design (`_mt5_lock` + the per-account chain lock). Those exist
   because the donor's terminal is shared across many users' concurrent login
   chains on one always-on VPS process. This program has one user and one terminal
@@ -92,8 +93,8 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Error-code constant sets — DERIVED from agent/error_codes.py's MT5_ERROR_CODES
-# table, never redeclared as literals. Editing that one table (e.g. the second
-# developer's probe in plan 39-17) automatically keeps these sets correct; there is
+# table, never redeclared as literals. Editing that one table (e.g. once the second
+# developer's own live probe reports back) automatically keeps these sets correct; there is
 # no second place to remember to update.
 # ---------------------------------------------------------------------------
 def _codes_with_category(category: ErrorCategory) -> frozenset[int]:
@@ -105,8 +106,8 @@ def _codes_with_category(category: ErrorCategory) -> frozenset[int]:
 AUTH_ERROR_CODES: frozenset[int] = _codes_with_category(ErrorCategory.AUTH_FAILED)
 TIMEOUT_ERROR_CODES: frozenset[int] = _codes_with_category(ErrorCategory.TIMEOUT)
 # Connection-class only — deliberately EXCLUDES the algo-trading-disabled codes,
-# which now get their own category and their own outcome branch (39-CONTEXT.md D-09
-# §12.1), unlike the donor's own IPC_UNAVAILABLE_ERROR_CODES, which lumped both
+# which now get their own category and their own outcome branch, unlike the donor's
+# own IPC_UNAVAILABLE_ERROR_CODES, which lumped both
 # together.
 IPC_UNAVAILABLE_ERROR_CODES: frozenset[int] = _codes_with_category(
     ErrorCategory.CONNECTION_ERROR
@@ -126,8 +127,8 @@ def initialize_terminal(path: Optional[str] = None) -> bool:
     call `find_terminal_path()` itself. Either way, as soon as no path is available
     at all, this raises `TerminalNotFoundError` — the one caller that converts
     `find_terminal_path()`'s own "return None, never raise" contract into the
-    exception the GUI (a later plan) catches for its blocking-but-non-crashing
-    notice («MetaTrader 5 не найден на этом компьютере», 39-CONTEXT.md D-09 §12.2).
+    exception `agent/main.py`'s GUI catches for its blocking-but-non-crashing
+    notice («MetaTrader 5 не найден на этом компьютере»).
 
     There is deliberately no configuration option and no environment-variable
     override for this path — see `terminal_discovery.py`'s own module docstring for
@@ -172,8 +173,8 @@ def current_logged_in_account() -> Optional[dict[str, Any]]:
     currently logged in.
 
     Call this IMMEDIATELY after `initialize_terminal()`, before this program logs
-    into anything itself — this is 39-CONTEXT.md D-23's input. If a session was
-    already active at that moment, the caller (agent/main.py, a later plan) pins a
+    into anything itself. If a session was
+    already active at that moment, the caller (`agent/main.py`) pins a
     persistent notice for the rest of the run: the user may have been working in
     that account themselves.
 
@@ -365,11 +366,11 @@ def get_initial_stop_and_take_profit(
     and `tp` — mapped to `None` here for both, never stored as a literal `0.0`, so a
     real zero-distance value is never confused with "none set" downstream.
 
-    No live probe has confirmed the `tp` sentinel the way the donor's own
-    31-03-SUMMARY.md confirmed the `sl` one on a real account — this is inferred by
+    No live probe has confirmed the `tp` sentinel the way a prior live test on a real
+    account confirmed the `sl` one — this is inferred by
     symmetry with `sl` (both are 0.0-defaulted numeric fields on the same MT5
     `TradeOrder` record) and is an explicit candidate for the second developer's
-    live pass in plan 39-17, not a confirmed fact.
+    own live pass, not a confirmed fact.
     """
     if not MT5_AVAILABLE:
         return None, None

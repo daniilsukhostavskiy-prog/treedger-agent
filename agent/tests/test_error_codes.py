@@ -71,7 +71,7 @@ def test_minus_10006_maps_to_algotrading_disabled():
 
 def test_contested_minus_6_resolves_to_connection_error_never_auth_failed():
     """
-    39-RESEARCH.md Pitfall 1: this repo's own working classifier and the official
+    This repo's own working classifier and the official
     MQL5 docs assign OPPOSITE meanings to -6. The table must resolve the conflict
     toward the recoverable side (CONNECTION_ERROR), never AUTH_FAILED, since only
     AUTH_FAILED can ever feed the broker_closed heuristic.

@@ -1,10 +1,13 @@
 """
-agent/tests/test_ui_state.py — every `<behavior>` bullet for `agent/ui_state.py`
-(39-16-PLAN.md Task 1). Pure-Python, no tkinter, no MetaTrader5, no display — this is
-the real test coverage for the window's entire behaviour (see `ui_state.py`'s own
+agent/tests/test_ui_state.py — the test coverage for `agent/ui_state.py`,
+including the «Программа устарела»
+protocol-too-old notice. Pure-Python, no tkinter, no MetaTrader5, no display — this
+is the real test coverage for the window's entire behaviour (see `ui_state.py`'s own
 module docstring for why).
 """
 from __future__ import annotations
+
+import pytest
 
 from agent import ui_state
 
@@ -350,3 +353,103 @@ def test_reduce_never_mutates_the_input_state() -> None:
 
     assert state.rows == snapshot_rows
     assert state.notices == snapshot_notices
+
+
+# ---------------------------------------------------------------------------
+# «Программа устарела» — ProtocolTooOldEvent.
+# "Reducing ProtocolTooOldEvent pins the protocol-too-old notice into the
+# state's notice set."
+# ---------------------------------------------------------------------------
+
+def test_protocol_too_old_event_pins_the_notice() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY)
+
+    new_state = ui_state.reduce(state, ui_state.ProtocolTooOldEvent())
+
+    assert ui_state.NOTICE_PROTOCOL_TOO_OLD in new_state.notices
+
+
+def test_protocol_too_old_event_disables_refresh() -> None:
+    """"Reducing ProtocolTooOldEvent leaves the refresh action disabled, because
+    retrying cannot succeed against a server that refuses this build."""
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY, refresh_disabled=False)
+
+    new_state = ui_state.reduce(state, ui_state.ProtocolTooOldEvent())
+
+    assert new_state.refresh_disabled is True
+
+
+def test_protocol_too_old_notice_survives_every_subsequent_unrelated_event() -> None:
+    """"The pinned notice survives every subsequent unrelated event — notices only
+    ever grow, never shrink, exactly as the existing notices behave."""
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY)
+
+    state = ui_state.reduce(state, ui_state.ProtocolTooOldEvent())
+    assert ui_state.NOTICE_PROTOCOL_TOO_OLD in state.notices
+
+    state = ui_state.reduce(
+        state, ui_state.AccountProgressEvent(mt_login="111", phase=ui_state.PHASE_LOGIN)
+    )
+    assert ui_state.NOTICE_PROTOCOL_TOO_OLD in state.notices
+
+    state = ui_state.reduce(
+        state,
+        ui_state.AccountProgressEvent(mt_login="111", phase=ui_state.PHASE_DONE, trades_sent=3),
+    )
+    assert ui_state.NOTICE_PROTOCOL_TOO_OLD in state.notices
+
+    state = ui_state.reduce(state, ui_state.RateLimitedEvent(retry_after_seconds=30))
+    assert ui_state.NOTICE_PROTOCOL_TOO_OLD in state.notices
+
+    state = ui_state.reduce(state, ui_state.RunFinishedEvent())
+    assert ui_state.NOTICE_PROTOCOL_TOO_OLD in state.notices
+
+
+def test_notice_text_for_protocol_too_old_resolves_and_contains_the_download_url() -> None:
+    """"NOTICE_TEXT has an entry for the new notice, so rendering it cannot raise a
+    key error." "The notice text contains the download URL as literal text a person
+    can read and type."""
+    text = ui_state.NOTICE_TEXT[ui_state.NOTICE_PROTOCOL_TOO_OLD]
+
+    assert ui_state.DOWNLOAD_URL in text
+
+
+def test_notice_text_for_protocol_too_old_never_contains_an_http_status_number() -> None:
+    """A person reading the window is told what to do, not what the protocol
+    said — no status code anywhere in the rendered text."""
+    text = ui_state.NOTICE_TEXT[ui_state.NOTICE_PROTOCOL_TOO_OLD]
+
+    assert "426" not in text
+    assert "protocol_too_old" not in text
+
+
+def test_reduce_still_raises_on_a_genuinely_unknown_event_type() -> None:
+    """The new ProtocolTooOldEvent branch does not swallow the fallthrough — an
+    unrecognised event type still raises."""
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY)
+
+    with pytest.raises(TypeError):
+        ui_state.reduce(state, object())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Structural: ui_state.py still imports no GUI toolkit (asserted separately by the
+# verify command's own `ast` check too — this is the same assertion authored as a
+# real pytest test rather than only a shell one-liner).
+# ---------------------------------------------------------------------------
+
+def test_module_imports_no_gui_toolkit() -> None:
+    import ast
+    import pathlib
+
+    source_path = pathlib.Path(ui_state.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules |= {alias.name.split(".")[0] for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module.split(".")[0])
+
+    assert "tkinter" not in modules

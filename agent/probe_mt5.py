@@ -11,12 +11,12 @@ WHY THIS SCRIPT EXISTS: this repo's own working error classifier
 (mt5-service/services/error_classification.py) and the official MQL5 docs assign
 OPPOSITE meanings to some of the same numeric error codes, and NEITHER source names a
 code meaning "this account no longer exists on the broker's side" — a closed prop
-challenge today files under the exact same category as a wrong password
-(39-CONTEXT.md R-01, 39-RESEARCH.md Pitfall 1 / Open Question 1). Writing
+challenge today files under the exact same category as a wrong password. This is
+an open, unconfirmed empirical question. Writing
 `agent/errors.py`'s `broker_closed` detector, or trusting the donor's registry-path
 shortcut, on top of that would be guesswork. This script settles those questions
-empirically instead. Nothing in `agent/mt5_bridge.py` / `agent/errors.py` (a later,
-deliberately blocked plan task) is written until this script's real output is recorded
+empirically instead. Nothing in `agent/mt5_bridge.py` / `agent/errors.py` that depends on
+the answer is written until this script's real output is recorded
 in `agent/PROBE-RESULTS.md`.
 
 This file is imported by NOTHING in this package — it is a script, not a library.
@@ -114,8 +114,8 @@ def _section_1_registry_dump() -> Optional[str]:
 
 def _capture_pre_existing_session() -> Optional[dict]:
     """Must only be called AFTER a successful mt5.initialize(), and BEFORE any
-    login attempt (Section 3) — this is the input D-23's collision warning depends
-    on."""
+    login attempt (Section 3) — this is the input the "program switched my terminal
+    account" collision warning depends on."""
     account = mt5.account_info()
     if account is None:
         return None
@@ -249,8 +249,10 @@ def _section_3_error_codes() -> None:
             )
     print(
         "\nCompare the three last_error() tuples above by eye: does ANY field differ\n"
-        "between the closed-account row and the wrong-password row? If not,\n"
-        "broker_closed must be implemented as a heuristic, never a code lookup (R-01)."
+        "between the closed-account row and the wrong-password row? If not, no MT5\n"
+        "error code can ever distinguish the two cases — this program's own design\n"
+        "already assumes that and never tries to guess 'closed by broker' automatically;\n"
+        "the owner's own explicit action in their browser session is the only path there."
     )
 
 

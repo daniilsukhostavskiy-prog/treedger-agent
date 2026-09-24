@@ -3,8 +3,8 @@ agent/ui_state.py — the window's entire behaviour, as a pure, Tk-free reducer.
 
 WHY THIS FILE IMPORTS NO GUI TOOLKIT AT ALL
 --------------------------------------------------------------------------
-`agent/main.py` (the only place tkinter is ever imported in this package, 39-16-PLAN.md
-Task 2) is deliberately thin: it builds widgets, drains a queue on a `root.after` timer,
+`agent/main.py` (the only place tkinter is ever imported in this package) is deliberately
+thin: it builds widgets, drains a queue on a `root.after` timer,
 and renders whatever `UiState` this module hands it. Every actual DECISION the window
 makes — which screen is showing, what each account row says, which notice is pinned —
 lives here instead, behind one pure function: `reduce(state, event) -> UiState`. That
@@ -14,7 +14,7 @@ coverage for this program's GUI; the Tk layer on top of it stays thin enough not
 its own suite.
 
 No `import tkinter` (or any other GUI toolkit) appears anywhere below — enforced
-mechanically by 39-16-PLAN.md's own AST-based verify command for this file, not merely
+mechanically by this folder's own AST-based structural audit, not merely
 promised in this docstring.
 
 Why the phase constants below are a SEPARATE copy of `agent/sync.py`'s `PHASE_*`
@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Union
 
 # ---------------------------------------------------------------------------
-# Screens — exactly the four named in 39-16-PLAN.md's own artifacts section.
+# Screens — exactly the four this window can ever show.
 # ---------------------------------------------------------------------------
 SCREEN_PAIRING = "pairing"
 SCREEN_READY = "ready"
@@ -61,24 +61,39 @@ PHASE_FAILED = "failed"
 
 # ---------------------------------------------------------------------------
 # Pinned notices — a small, closed set. Once a notice is pinned it is NEVER removed
-# by a later, unrelated event (39-CONTEXT.md D-23's "persists for the remainder of the
-# run" requirement, and this plan's own behaviour bullet) — `UiState.notices` only
+# by a later, unrelated event — a pinned notice persists for the remainder of the
+# run, by design — `UiState.notices` only
 # ever grows across a reduce() call, never shrinks.
 # ---------------------------------------------------------------------------
 NOTICE_TERMINAL_SWITCHED = "terminal_switched"
 NOTICE_TOKEN_REVOKED = "token_revoked"
 NOTICE_NO_TERMINAL = "no_terminal"
+NOTICE_PROTOCOL_TOO_OLD = "protocol_too_old"
+
+# The product's own step-by-step download page.
+# Transcribed by hand, matching `agent/main.py`'s own `_DEFAULT_BASE_URL`
+# literal — this constant is deliberately NOT derived from `config_store`'s stored
+# `base_url`, because the download page must resolve even for a user whose stored
+# base URL is stale or missing.
+DOWNLOAD_URL = "https://treedger.com/download"
 
 NOTICE_TEXT: "dict[str, str]" = {
-    # Verbatim from 39-CONTEXT.md D-23 — no login restore, no separate terminal
+    # No login restore, no separate terminal
     # instance, because neither exists. This is a warning, not a fix-it button.
     NOTICE_TERMINAL_SWITCHED: (
         "Программа переключала счета в вашем терминале MT5. "
         "Если вы в нём работали — войдите в свой счёт заново."
     ),
     NOTICE_TOKEN_REVOKED: "Токен был отозван. Пройдите привязку заново.",
-    # Verbatim from 39-CONTEXT.md D-09 §12.2.
     NOTICE_NO_TERMINAL: "MetaTrader 5 не найден на этом компьютере.",
+    # A heading, one line of reason, and the /download URL as literal text a
+    # person can read and type — DELIBERATELY NO HTTP STATUS NUMBER AND NO ERROR
+    # CODE anywhere in this string. A person reading the window is told what to do,
+    # not what the protocol said.
+    NOTICE_PROTOCOL_TOO_OLD: (
+        f"Программа устарела. Она больше не может синхронизировать данные с сервером. "
+        f"Скачайте новую версию: {DOWNLOAD_URL}"
+    ),
 }
 
 
@@ -137,8 +152,9 @@ class UiState:
         """
         `(completed + failed) / total * 100` — a run with one failed account still
         reaches 100%, because a failed account has still been WALKED, just not
-        succeeded (this is readiness criterion 8's visible half: the run as a whole
-        finishes even though one row is red). `0` accounts is `0.0`, never a
+        succeeded (the run as a whole
+        finishes even though one row is red — one account's failure never stops the
+        rest). `0` accounts is `0.0`, never a
         `ZeroDivisionError`.
         """
         if self.total_accounts == 0:
@@ -151,7 +167,7 @@ def initial_state(*, has_token: bool, terminal_found: bool) -> UiState:
     The screen the window opens to, decided once at startup from exactly two facts:
     whether a token is already stored, and whether a terminal could be found at all.
 
-    A missing terminal wins regardless of token state (39-CONTEXT.md D-09 §12.2) —
+    A missing terminal wins regardless of token state —
     there is nothing useful this program can do with a token if MT5 itself cannot be
     reached, so the no-terminal screen takes priority and the refresh action starts
     disabled.
@@ -179,7 +195,7 @@ class AccountProgressEvent:
     module's own docstring for why this file does not import `agent.sync` itself
     to reuse its dataclass directly). The one `PHASE_TERMINAL_CHECK` event per run
     (`mt_login` and `account_id` both `None`, `pre_existing_session` set only when
-    D-23 fired) is this reducer's run-start marker: it clears the previous run's
+    a pre-existing terminal session was found) is this reducer's run-start marker: it clears the previous run's
     rows and moves the screen to `running`, rather than becoming a row itself.
     """
 
@@ -210,8 +226,7 @@ class UnauthorizedEvent:
     `AgentUnauthorizedError` (`agent/api_client.py`) surfaced anywhere in a run.
     `agent/main.py` is the one that calls `config_store.clear_token()` when it sees
     this — this reducer has no filesystem access of its own; it only moves the
-    screen back to pairing and pins the revoked notice (readiness criterion 9's
-    user-visible half).
+    screen back to pairing and pins the revoked notice.
     """
 
 
@@ -243,6 +258,34 @@ class TerminalNotFoundEvent:
     """
 
 
+@dataclass(frozen=True)
+class ProtocolTooOldEvent:
+    """
+    `agent.api_client.AgentProtocolError` (HTTP 426, `protocol_too_old`) surfaced
+    anywhere in a run — the server has refused this build's `X-Agent-Protocol`
+    version outright. `agent/main.py`'s own except chain is what wires this event
+    in; this event only defines the
+    state transition that clause dispatches into. Note the ordering constraint
+    that wiring depends on: `AgentProtocolError` is a subclass of
+    `agent.api_client.AgentApiError`, so its `except` clause must come FIRST, or the
+    generic `AgentApiError` clause silently swallows it.
+
+    WHY A PINNED NOTICE, NOT A NEW SCREEN: the message is deliberately shown "as text in
+    the program window, never as an error code", and the existing pinned-notice
+    machinery (`NOTICE_TERMINAL_SWITCHED`, `NOTICE_TOKEN_REVOKED`,
+    `NOTICE_NO_TERMINAL`) already renders multi-line text above whatever screen is
+    showing. A screen swap would discard the account rows the person is looking at
+    for no gain — this reducer's job is to inform, not to hide what the user was
+    already reading.
+
+    WHAT THIS DELIBERATELY DOES NOT DO (mirrors `agent/main.py`'s own head
+    docstring): no auto-download, no self-replacement, no download-and-execute path
+    of any kind. A version notice is plain text with a link the user follows
+    themselves — this program never fetches, opens, or executes anything on this
+    condition.
+    """
+
+
 Event = Union[
     AccountProgressEvent,
     PairingSucceededEvent,
@@ -251,6 +294,7 @@ Event = Union[
     RateLimitedEvent,
     RunFinishedEvent,
     TerminalNotFoundEvent,
+    ProtocolTooOldEvent,
 ]
 
 
@@ -365,6 +409,21 @@ def reduce(state: UiState, event: Event) -> UiState:
             notices=state.notices | {NOTICE_NO_TERMINAL},
             pairing_error=state.pairing_error,
             rate_limit_retry_after_seconds=None,
+            refresh_disabled=True,
+        )
+
+    if isinstance(event, ProtocolTooOldEvent):
+        # Pinned notice, not a screen swap — see the event's own docstring for why.
+        # `refresh_disabled=True` because retrying cannot succeed against a server
+        # that refuses this build outright; the screen itself is left exactly as it
+        # was, matching the "notices only ever grow" convention every other pinned
+        # notice in this module already follows.
+        return UiState(
+            screen=state.screen,
+            rows=dict(state.rows),
+            notices=state.notices | {NOTICE_PROTOCOL_TOO_OLD},
+            pairing_error=state.pairing_error,
+            rate_limit_retry_after_seconds=state.rate_limit_retry_after_seconds,
             refresh_disabled=True,
         )
 

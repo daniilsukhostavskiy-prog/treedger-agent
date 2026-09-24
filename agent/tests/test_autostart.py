@@ -3,9 +3,10 @@ agent/tests/test_autostart.py — behavioural and structural tests for agent/aut
 
 `subprocess.run` is monkeypatched module-wide to a recorder that captures each
 invocation's argument LIST (never a rendered string) and returns canned scheduler
-output, per the plan's own testing instructions. Structural claims (parameter-less
+output. Structural claims (parameter-less
 signatures, no `shell=True`) are decided by `ast`, matching this project's
-grep-is-not-proof convention (40-CONTEXT.md D-16).
+established grep-is-not-proof convention: a text search finds the words used to
+describe a prohibition, not what the code actually does.
 """
 from __future__ import annotations
 

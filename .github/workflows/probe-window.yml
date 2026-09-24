@@ -53,9 +53,36 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Set up Python
+        id: setup_python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Restore the Nuitka compile cache (the 23-minute numpy compile)
+        # Nuitka keeps a ccache/bytecode cache and its downloaded C toolchain under
+        # %LOCALAPPDATA%\Nuitka\Nuitka\Cache. A GitHub-hosted runner is ephemeral, so
+        # without this step that directory starts EMPTY on every run and Nuitka
+        # recompiles numpy's sources to C from scratch every single time.
+        #
+        # Measured cost of not having it: 1m 09s without numpy versus 23-24 minutes
+        # with it (probe runs #4/#5/#6 at 23m17s / ~23m / 24m46s). Run #6 changed only
+        # a PowerShell file -- no build input at all -- and was still not faster than
+        # run #4, which is exactly the symptom of a cache that never survives the run.
+        #
+        # The key covers what actually invalidates compiled objects: the runner image,
+        # the Python version, the pinned dependency set, and the Nuitka flag set. It
+        # deliberately does NOT include the agent's own sources -- those compile in
+        # seconds. numpy is the entire cost, and it changes only when its pin changes.
+        #
+        # NOTE: the FIRST run after adding this is still a cold ~23 minutes, because it
+        # populates the cache. The saving appears from the second run onward.
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Nuitka\Nuitka\Cache
+          key: nuitka-${{ runner.os }}-py${{ steps.setup_python.outputs.python-version }}-${{ hashFiles('agent/requirements.txt') }}-${{ env.NUITKA_FLAGS }}
+          restore-keys: |
+            nuitka-${{ runner.os }}-py${{ steps.setup_python.outputs.python-version }}-${{ hashFiles('agent/requirements.txt') }}-
+            nuitka-${{ runner.os }}-py${{ steps.setup_python.outputs.python-version }}-
 
       - name: Install dependencies + Nuitka
         shell: pwsh

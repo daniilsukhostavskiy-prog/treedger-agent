@@ -1,7 +1,7 @@
 """
 agent/config_store.py — the ONLY place this program persists anything to disk.
 
-Deliberately trivial, per 39-PATTERNS.md's own note not to over-engineer this: one JSON
+Deliberately trivial, by design: one JSON
 file, exactly two keys, standard-library `json` only. This module is not a general
 key-value store and must never grow a third key.
 
@@ -17,8 +17,7 @@ re-fetched from the server on the next run anyway.
 
 The file lives under the current user's own per-user application-data directory —
 never beside the program itself and never under a Program Files-style path — so this
-program never needs, and never asks for, administrator rights (PHASE-LOCAL-SYNC-SPEC.md
-§8 / SYNC-LOCAL-AGENT-HANDOFF.md §5.7).
+program never needs, and never asks for, administrator rights.
 
 Reads and writes use the standard `json` module only. Never `pickle`, never `yaml` of
 any kind. A missing or corrupt config file is treated as "nothing stored yet" — this
@@ -70,7 +69,7 @@ def _app_data_dir() -> Path:
     The current user's own per-user application-data directory — never a path beside
     this program's own source, never anywhere under Program Files. `%APPDATA%` is the
     standard per-user, no-admin-rights-required location on Windows (this program's one
-    supported platform this phase, PHASE-LOCAL-SYNC-SPEC.md §9); a dotfile under the
+    supported platform); a dotfile under the
     user's home directory is the fallback for any other platform this test suite runs
     on (e.g. this repository's own non-Windows dev/CI environment).
     """
@@ -152,11 +151,13 @@ def save_token(token: str) -> None:
     same `token` key), replacing whatever was stored before. Callers (agent/sync.py)
     MUST call this immediately on receiving a rotated token from `/api/agent/accounts`
     — a token received but never stored is exactly the dropped-response lockout the
-    D-26 grace window exists to survive.
+    server's grace window (see `agent/api_client.py`'s `AccountsFetchResult` docstring)
+    exists to survive.
 
     A `dpapi.DpapiUnavailableError` (or the underlying `OSError` from a failed Win32
     call) is allowed to propagate out of this function rather than being swallowed:
-    D-20's "the program refuses to store the token and says so" lives at THIS
+    "the program refuses to store the token and says so" (see `agent/dpapi.py`'s own
+    docstring) lives at THIS
     boundary, not inside `dpapi.py` itself — this function must never fall back to
     storing the token in any other form.
     """

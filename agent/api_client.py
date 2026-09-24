@@ -8,12 +8,19 @@ VERBATIM, never paraphrased. If `contract.ts` changes, this file changes in the 
 commit — its own file header says so, and this docstring repeats it because a Python
 reader of this file will never see that TypeScript header.
 
+This rule also covers `HEADER_AGENT_PROTOCOL`, `HEADER_BUILD_VERSION` and
+`AGENT_BUILD_VERSION` below: they are the Python-side
+transcription of `contract.ts`'s `AGENT_PROTOCOL_HEADER`, `AGENT_BUILD_VERSION_HEADER`
+and the 426/`protocol_too_old` refusal code, and they must be kept in lockstep with
+that file in the same change — see `AGENT_BUILD_VERSION`'s own docstring below for the
+diagnostic-only constraint that goes with it.
+
 TLS — NOT CONFIGURABLE, READ BEFORE "FIXING" A CONNECTION ERROR
 ------------------------------------------------------------------
 Every request in this module goes out over `requests`' own default HTTPS behaviour,
 which verifies the server's TLS certificate. No function in this file accepts a
 "verify" argument, no call below ever passes one, and no TLS warning is ever
-suppressed. This is deliberate and permanent (PHASE-LOCAL-SYNC-SPEC.md §8) — a
+suppressed. This is deliberate and permanent — a
 certificate-verification bypass here would let a network-position attacker read (and
 rewrite) every investor password this program ever receives. Do not add a `verify=`
 parameter to this file "to work around a corporate proxy" or any other reason; that is
@@ -41,6 +48,28 @@ import requests
 # ---------------------------------------------------------------------------
 AGENT_PROTOCOL_VERSION: int = 1
 MAX_TRADES_PER_BATCH: int = 500
+
+# Header name constants, transcribed from contract.ts's `AGENT_PROTOCOL_HEADER` /
+# `AGENT_BUILD_VERSION_HEADER` — named here so the two strings
+# stop being repeated inline across this module.
+HEADER_AGENT_PROTOCOL: str = "X-Agent-Protocol"
+HEADER_BUILD_VERSION: str = "X-Agent-Build-Version"
+
+# THIS IS A DIAGNOSTIC BOUNDARY, NOT A DECISION INPUT — copied verbatim in
+# meaning from contract.ts's `AGENT_BUILD_VERSION_HEADER` docstring, this constant's
+# TypeScript-side twin (src/lib/api/agent/contract.ts). This value goes only into
+# logs and diagnostics; it NEVER participates in any decision this program makes —
+# not the protocol gate, not behaviour branching, not limits. It is a diagnostic
+# fact, not a control value. The reason this is written down rather than assumed:
+# otherwise someone will one day add "and if the build is older than X, then…", and
+# the build version quietly becomes a second gate that grows on every cosmetic
+# release — exactly the drawback rejected for the protocol version-floor mechanism,
+# creeping back in through this constant instead. Adding such a conditional is the regression this
+# docstring exists to prevent — do not do it without a new owner decision.
+# Enforced structurally, not just by this comment:
+# `agent/tests/test_api_client.py`'s `ast`-based test fails if this name ever appears
+# inside any `If`/`IfExp`/`Compare` node in this module.
+AGENT_BUILD_VERSION: str = "dev"
 
 _CONNECT_TIMEOUT_SECONDS: float = 10.0
 _READ_TIMEOUT_SECONDS: float = 60.0
@@ -87,11 +116,14 @@ class AgentProtocolError(AgentApiError):
 
 class AccountsFetchResult(NamedTuple):
     """
-    `fetch_accounts()`'s return shape. `token` is the ROTATED token for the NEXT run
-    (D-26) — the CALLER (agent/sync.py) must persist it via
+    `fetch_accounts()`'s return shape. `token` is the ROTATED token for the NEXT run —
+    the CALLER (agent/sync.py) must persist it via
     `config_store.save_token()` IMMEDIATELY on receiving this result, because the
-    server has already rotated by the time this function returns; a crash between the
-    two is exactly what the D-26 grace window exists to survive.
+    server has already rotated by the time this function returns. A crash between the
+    two is exactly what the server's grace window exists to survive: the server keeps
+    accepting the immediately-previous token for a short window after rotation, so a
+    program that crashed before it could save the new token can still authenticate on
+    its next run and receive a fresh one, rather than being permanently locked out.
     """
 
     token: str
@@ -101,7 +133,7 @@ class AccountsFetchResult(NamedTuple):
 class ApiClient:
     """
     Thin `requests`-based wrapper around the four `/api/agent/*` endpoints
-    (`src/app/api/agent/*/route.ts`, plan 39-11). Holds a base URL and a bearer token;
+    (`src/app/api/agent/*/route.ts` on the server side). Holds a base URL and a bearer token;
     every method call is a single logical operation, with `post_trades` internally
     issuing one HTTP request per chunk.
     """
@@ -117,7 +149,10 @@ class ApiClient:
     def _headers(self, *, authorized: bool) -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
-            "X-Agent-Protocol": str(AGENT_PROTOCOL_VERSION),
+            HEADER_AGENT_PROTOCOL: str(AGENT_PROTOCOL_VERSION),
+            # Diagnostic-only — see AGENT_BUILD_VERSION's own docstring. Never read
+            # back by any branch in this module.
+            HEADER_BUILD_VERSION: AGENT_BUILD_VERSION,
         }
         if authorized:
             if not self.token:
@@ -181,10 +216,21 @@ class ApiClient:
             # clause covers every JSON-parse failure `Response.json()` can raise.
             body_error = exc
 
-        if response.status_code == 400 and isinstance(body, dict) and body.get("error") == "protocol":
+        if response.status_code == 426:
+            # Fires on the status ALONE — even when the body failed to parse as
+            # JSON (`body_error is not None` above) — so a server refusing this
+            # program's protocol version is always recognisable as «Программа
+            # устарела» rather than surfacing as a generic JSON-parse failure.
+            # The server only ever sends 426 for this one
+            # reason (`agentErrorResponse(426, 'protocol_too_old')` is its only
+            # caller in `route-auth.server.ts` / `pair/redeem/route.ts`), so no
+            # further inspection of the body's `error` field is needed to know why.
+            # An earlier 400/`protocol` response shape deliberately no
+            # longer matches here — it falls through to the generic error path
+            # below, proving the rename completed rather than being additive.
             raise AgentProtocolError(
                 "the server refused this program's protocol version — an update is required",
-                status_code=400,
+                status_code=426,
             )
 
         if not response.ok:

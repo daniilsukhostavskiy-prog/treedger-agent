@@ -1,6 +1,6 @@
 """
-agent/constants.py — the phase-40 tuning constants, and ONLY the phase-40 tuning
-constants.
+agent/constants.py — the periodic-sync and staleness tuning constants, and ONLY those
+tuning constants.
 
 This module holds exactly two module-level values: the fixed periodic-sync interval
 and the silence threshold the SITE uses to flag a stale agent. It has no imports at
@@ -42,16 +42,16 @@ WHAT IS DELIBERATELY NOT HERE
 ----------------------------------------------------------------------------------
 `AGENT_PROTOCOL_VERSION`, `MAX_TRADES_PER_BATCH`, `_CONNECT_TIMEOUT_SECONDS` and
 `_READ_TIMEOUT_SECONDS` all currently live inline in `agent/api_client.py`. This
-phase's own scope (D-28) is the two NEW constants only — moving those existing,
-working Phase 39 constants here for tidiness alone, days before this folder moves to
+module's own scope is the two NEW constants only — moving those existing,
+working constants here for tidiness alone, so close to this folder moving to
 its own repository, is out of scope. Do not "finish the job" by migrating them.
 """
 
-# D-21: a fixed one-hour periodic sync, always, while the program's window is open —
+# A fixed one-hour periodic sync, always, while the program's window is open —
 # never tied to the autostart checkbox. See the module docstring above for why.
 SYNC_INTERVAL_SECONDS: int = 3600
 
-# D-24/D-28: the agent-side transcription of `AGENT_STALE_AFTER_HOURS` in
+# The agent-side transcription of `AGENT_STALE_AFTER_HOURS` in
 # src/lib/constants/agent.ts, the value the SITE actually reads and acts on. Change
 # both together.
 AGENT_SILENCE_THRESHOLD_HOURS: int = 36

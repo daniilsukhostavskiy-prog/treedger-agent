@@ -338,7 +338,7 @@ def test_profit_factor_is_finite_when_there_are_no_losing_trades():
 
 
 # ---------------------------------------------------------------------------
-# compute_session (D-04 locked windows; NY wins the 12:00-15:00 overlap)
+# compute_session (locked windows; NY wins the 12:00-15:00 overlap)
 # ---------------------------------------------------------------------------
 
 def test_compute_session():
@@ -377,12 +377,12 @@ def test_compute_session_maps_to_exactly_one_of_four_or_none():
 
 
 # ---------------------------------------------------------------------------
-# group_deals_into_positions (D-02 round-turn mapping; partial closes,
+# group_deals_into_positions (round-turn mapping; partial closes,
 # reversals, still-open exclusion)
 # ---------------------------------------------------------------------------
 
 def test_group_deals_into_positions():
-    """Required Wave 0 test (05-VALIDATION.md): covers a partial-close case
+    """Covers a partial-close case
     AND a reversal case in one pass — one closed position -> one dict,
     still-open positions excluded, direction from the opening deal,
     entry/exit volume-weighted."""
@@ -470,7 +470,7 @@ def test_group_deals_into_positions_session_persisted():
 
 
 def test_zero_closed_trades_yields_no_journal_positions():
-    """The lone BALANCE deal must not be grouped into a journal trade (D-02) — balance-
+    """The lone BALANCE deal must not be grouped into a journal trade — balance-
     operation deals never become positions."""
     # Real MT5 balance deals carry position_id 0 and no closing leg.
     balance_deal = {

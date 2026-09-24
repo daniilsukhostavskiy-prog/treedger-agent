@@ -2,10 +2,10 @@
 Deposit-adjusted statistics engine for the Treedger local MT5 sync agent.
 
 VERBATIM PORT from `mt5-service/services/stats_compute.py` (the donor stays in the tree
-untouched as a working donor — PHASE-LOCAL-SYNC-SPEC.md §9). This is a transcription, not
+untouched as a working donor). This is a transcription, not
 a redesign: no formula improved, no field renamed, no comparison changed, no boundary
 adjusted. Transcription drift — not absence — is the failure mode
-`agent/tests/test_positions.py` exists to catch (39-03-PLAN.md Task 2).
+`agent/tests/test_positions.py` exists to catch.
 
 The one intentional, test-driven naming change: the donor's private `_VOLUME_EPSILON` is
 exposed here as the public `VOLUME_EPSILON`, since the ported test suite imports it
@@ -39,7 +39,7 @@ DEAL_TYPE_SELL: int = 1      # sell trade deal
 DEAL_ENTRY_IN: int = 0       # opening leg (IN)
 DEAL_ENTRY_OUT: int = 1      # closed trade (OUT)
 
-# D-04 locked session windows (UTC) — see compute_session() below.
+# Locked session windows (UTC) — see compute_session() below.
 VOLUME_EPSILON: float = 1e-9
 
 # Number of seconds in common look-back windows
@@ -304,9 +304,9 @@ def compute_aggregate_stats(
 
 def compute_session(opened_at_utc: datetime) -> Optional[str]:
     """
-    Classify a trade's open time into a session chip (JOURNAL-02 / D-04).
+    Classify a trade's open time into a session chip.
 
-    Windows are LOCKED (owner decision, CONTEXT.md D-04), all boundaries in UTC:
+    Windows are LOCKED (owner decision), all boundaries in UTC:
         Asia:      23:00-06:00
         Frankfurt: 06:00-07:00
         London:    07:00-12:00
@@ -315,8 +315,8 @@ def compute_session(opened_at_utc: datetime) -> Optional[str]:
 
     CRITICAL: NY must be checked FIRST in the if-chain. Both the naive "NY"
     window (12:00-20:00) and the naive "London" window (07:00-12:00) do NOT
-    actually overlap on paper (12 is the shared boundary), but D-04's overlap
-    language plus RESEARCH.md Pattern 2 make explicit that any ambiguity in
+    actually overlap on paper (12 is the shared boundary), but the owner's own
+    overlap rule makes explicit that any ambiguity in
     the 12:00-15:00 band must resolve to NY — checking NY before London is
     the entire correctness argument here, not just the boundary values.
     """
@@ -329,7 +329,7 @@ def compute_session(opened_at_utc: datetime) -> Optional[str]:
         return "Frankfurt"
     if hour >= 23 or hour < 6:
         return "Asia"
-    return None  # 20:00-23:00 UTC — no session (D-04)
+    return None  # 20:00-23:00 UTC — no session
 
 
 # ---------------------------------------------------------------------------
@@ -338,18 +338,17 @@ def compute_session(opened_at_utc: datetime) -> Optional[str]:
 
 def group_deals_into_positions(deals: list[dict]) -> list[dict]:
     """
-    Group MT5 deals by `position_id` into one dict per fully-CLOSED position
-    (JOURNAL-01 / D-02 round-turn mapping).
+    Group MT5 deals by `position_id` into one dict per fully-CLOSED position —
+    a round-turn mapping.
 
-    Input deals must already carry the Phase 5 fields added to
-    mt5_bridge.get_history_deals() (position_id, symbol, volume, price) and
+    Input deals must already carry the fields
+    `mt5_bridge.get_history_deals()` adds (position_id, symbol, volume, price) and
     must already have `time` normalized to UTC Unix seconds (see
-    normalize_to_utc / routers/verify.py's `deals_normalised` pattern) —
+    `normalize_to_utc()` / the server-side `deals_normalised` pattern it mirrors) —
     this function does no timezone conversion of its own beyond building the
     output datetimes from those already-UTC seconds.
 
-    Grouping rules (Claude's Discretion, RESEARCH.md Pattern 1 + CONTEXT.md
-    "Per-position aggregation edge cases"):
+    Grouping rules for the per-position aggregation edge cases below:
       - Deals are grouped strictly by `position_id` — this is MT5's own
         round-turn identity and is the only grouping key used.
       - Within a group, deals with entry == DEAL_ENTRY_IN (0) are "opening
@@ -365,7 +364,7 @@ def group_deals_into_positions(deals: list[dict]) -> list[dict]:
         closing deals at all, or with closing volume strictly less than
         opening volume (an in-progress partial close), is STILL OPEN and is
         excluded from the output entirely (its floating P&L is already
-        reflected in the equity curve, not the journal — D-02).
+        reflected in the equity curve, not the journal).
       - Reversals: MT5 represents a reversal as a close of the original
         position_id plus the open of a brand-new position_id in the opposite
         direction (not a single row that mutates position_id in place) — so
@@ -387,7 +386,7 @@ def group_deals_into_positions(deals: list[dict]) -> list[dict]:
         result (float)      — summed profit across every deal in the group,
         commission (float)  — summed across every deal in the group,
         swap (float)        — summed across every deal in the group,
-        session (str|None)  — compute_session(opened_at) (D-04).
+        session (str|None)  — compute_session(opened_at).
     """
     groups: dict[int, list[dict]] = {}
     for deal in deals:
@@ -401,7 +400,7 @@ def group_deals_into_positions(deals: list[dict]) -> list[dict]:
         closing_legs = [d for d in ordered if d["entry"] == DEAL_ENTRY_OUT]
 
         if not closing_legs:
-            continue  # still open — excluded from the journal (D-02)
+            continue  # still open — excluded from the journal
 
         opening_volume = sum(d["volume"] for d in opening_legs)
         closing_volume = sum(d["volume"] for d in closing_legs)

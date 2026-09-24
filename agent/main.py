@@ -4,8 +4,8 @@ agent/main.py — the program's window.
 CROSS-THREAD DISCIPLINE — READ THIS BEFORE TOUCHING THIS FILE
 --------------------------------------------------------------------------
 Tk's `mainloop()` owns the main thread, and EVERY widget read or mutation must
-happen on that same thread — Tcl/Tk itself is not thread-safe
-(39-RESEARCH.md Pitfall 4). This is a classic, well-documented footgun, and it is
+happen on that same thread — Tcl/Tk itself is not thread-safe.
+This is a classic, well-documented footgun, and it is
 easy to "simplify away" by accident, so the rule is spelled out once, here, at the
 top of the one file where it matters:
 
@@ -17,26 +17,41 @@ top of the one file where it matters:
   - The Tk main thread drains that queue on a `root.after(100, self._poll_queue)`
     timer. Only `_poll_queue` (and the methods it calls: `_dispatch` → `_render`)
     ever folds an event through `ui_state.reduce()` and touches a widget.
+  - `AgentWindow._on_periodic_tick` (the hourly sync timer) is ALSO a
+    `root.after` callback, exactly like `_poll_queue` — it runs on the Tk main
+    thread, never a background thread, and when it starts a sync it does so by
+    calling through `_on_refresh_clicked`, the same main-thread entry point a
+    manual click uses. It never touches a widget beyond what that call already
+    does.
 
 Do not "simplify" this by having the worker thread call a widget method directly,
 even for something that looks harmless (e.g. a one-line status update) — that is
 the exact class of bug this file exists to avoid, and it will not always crash
 loudly; it can just as easily corrupt Tk's internal state silently.
 
-WHAT THIS WINDOW DELIBERATELY DOES NOT DO (39-CONTEXT.md D-24)
+WHAT THIS WINDOW DELIBERATELY DOES NOT DO
 --------------------------------------------------------------------------
-No autostart registration, no tray icon, no packaged executable, no installer, no
-code signing, and no self-update check of any kind — if a version notice is ever
-shown, it is plain text with a link the user follows themselves, never a
-download-and-execute path. This window also never kills the user's MT5 terminal
-process and never restores a session behind their back (D-23) — it only warns.
+Autostart registration now exists, but it is opt-in only and never
+self-registering: the scheduler's CREATE verb is reachable from exactly one
+place, the checkbox's own handler, and the silent startup self-check may only
+repair an already-existing task's path, never create one. No tray icon and no
+self-update check of any kind still hold — if a version notice is ever shown
+(the protocol-too-old notice below), it is plain text with a link the user
+follows themselves, never a download-and-execute path. This window also never
+kills the user's MT5 terminal process and never restores a session behind their
+back — it only warns. This program never notifies, never
+pops up, and never raises itself above other windows on its own — the site
+watches for a silent program (via the agent's own authenticated requests), not
+for this window to announce anything.
 """
 from __future__ import annotations
 
+import logging
 import queue
 import sys
 import threading
 import webbrowser
+from dataclasses import dataclass
 from typing import Optional
 
 try:
@@ -51,9 +66,22 @@ except ImportError as exc:  # pragma: no cover - environment-specific; see READM
     )
     raise SystemExit(1) from exc
 
-from agent import api_client, config_store, mt5_bridge, sync, terminal_discovery, ui_state
+from agent import (
+    api_client,
+    autostart,
+    config_store,
+    constants,
+    mt5_bridge,
+    single_instance,
+    sync,
+    terminal_discovery,
+    ui_state,
+)
+
+logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_MS = 100
+_SYNC_INTERVAL_MS = constants.SYNC_INTERVAL_SECONDS * 1000
 _DEFAULT_BASE_URL = "https://treedger.com"
 _MT5_DOWNLOAD_URL = "https://www.metatrader5.com/en/download"
 
@@ -98,6 +126,15 @@ class AgentWindow:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(_POLL_INTERVAL_MS, self._poll_queue)
+        self._schedule_periodic_sync()
+
+        # Silent, log-only self-check — see repair_task_path()'s own
+        # docstring for why this never surfaces a dialog: the person made no
+        # mistake, so there is nothing to tell them. Runs on every start,
+        # regardless of whether autostart is enabled — it only EDITS an
+        # already-existing task; it can never create one (see
+        # _on_autostart_toggled, the one place create_task() is ever called).
+        logger.info("autostart path self-check: %s", autostart.repair_task_path())
 
     # -----------------------------------------------------------------
     # Widget construction — built once. `_render()` only ever mutates these
@@ -164,7 +201,7 @@ class AgentWindow:
         link.pack(anchor="w", padx=12, pady=(2, 12))
         link.bind("<Button-1>", lambda _event: webbrowser.open(_MT5_DOWNLOAD_URL))
 
-        # Deliberately DISABLED, never re-enabled from this screen (D-09 §12.2) — a
+        # Deliberately DISABLED, never re-enabled from this screen — a
         # fresh launch after installing MT5 is the only way forward.
         tk.Button(frame, text="Обновить", state="disabled").pack(anchor="w", padx=12)
 
@@ -187,6 +224,31 @@ class AgentWindow:
         self._rows_container = tk.Frame(frame)
         self._rows_container.pack(fill="both", expand=True, padx=12, pady=(6, 14))
 
+        # Reflects `task_exists()` at build time; the only place its own
+        # command handler (`_on_autostart_toggled`) ever runs is a click on THIS
+        # checkbox. The label means one thing only — whether the window is open
+        # or not — never whether the timer runs. Copy is the exact RU
+        # source-of-truth string from `src/lib/i18n/dictionaries/ru.ts`'s
+        # `download.step7.toggleLabel`/`.note`, not retyped from
+        # memory.
+        self._autostart_var = tk.BooleanVar(value=autostart.task_exists())
+        tk.Checkbutton(
+            frame,
+            text="Запускать вместе с Windows",
+            variable=self._autostart_var,
+            command=self._on_autostart_toggled,
+        ).pack(anchor="w", padx=12, pady=(4, 0))
+        tk.Label(
+            frame,
+            text=(
+                "Программа будет переключать счета в терминале — не включайте, "
+                "если торгуете с этого компьютера."
+            ),
+            fg=_COLOR_ERROR,
+            wraplength=520,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
     # -----------------------------------------------------------------
     # Rendering — MAIN THREAD ONLY. Called from __init__ and from `_dispatch`
     # (itself only ever called from `_on_pair_clicked`/`_on_refresh_clicked`, Tk
@@ -205,7 +267,7 @@ class AgentWindow:
             self._pairing_frame.pack(fill="both", expand=True)
         elif self.state.screen == ui_state.SCREEN_NO_TERMINAL:
             self._no_terminal_frame.pack(fill="both", expand=True)
-        else:  # ready or running — same visual screen, see 39-16-PLAN.md Task 2
+        else:  # ready or running — same visual screen, distinguished only by state
             self._render_ready_screen()
             self._ready_frame.pack(fill="both", expand=True)
 
@@ -290,6 +352,23 @@ class AgentWindow:
         worker = threading.Thread(target=self._run_sync_worker, args=(client,), daemon=True)
         worker.start()
 
+    def _on_autostart_toggled(self) -> None:
+        """
+        Tk command callback for the autostart checkbox — the ONLY place in this
+        entire program that ever calls `autostart.create_task()`. The
+        checkbox's own `tk.BooleanVar` already reflects the state the person just
+        requested by clicking it, so this handler simply acts on that value: calls
+        `create_task()` exactly once when it reads True, `remove_task()` exactly
+        once when it reads False. Never called from `__init__` — the silent
+        startup self-check (`autostart.repair_task_path()`) can only edit an
+        already-existing task, never create one; this handler is the sole
+        create-capable path, matching `agent/autostart.py`'s own structural split.
+        """
+        if self._autostart_var.get():
+            autostart.create_task()
+        else:
+            autostart.remove_task()
+
     # -----------------------------------------------------------------
     # Background worker — runs on its OWN thread. Touches `self._queue` and
     # nothing else belonging to this window: no widget, no `self.state`, no
@@ -323,10 +402,22 @@ class AgentWindow:
             return
         except api_client.AgentRateLimitedError as exc:
             self._queue.put(ui_state.RateLimitedEvent(retry_after_seconds=exc.retry_after_seconds))
+        except api_client.AgentProtocolError:
+            # MUST precede the generic (sync.SyncAbortedError, AgentApiError) clause
+            # below: AgentProtocolError is a SUBCLASS of AgentApiError
+            # (agent/api_client.py), and Python matches the FIRST clause whose type
+            # the raised exception is an instance of — swap this clause's position
+            # and the generic one below silently swallows every protocol-too-old
+            # refusal instead. This branch pushes a UI event and
+            # nothing else: no token clear, no retry, no fetch, no open.
+            self._queue.put(ui_state.ProtocolTooOldEvent())
+            self._queue.put(_SyncFinishedSentinel())
+            return
         except (sync.SyncAbortedError, api_client.AgentApiError):
             # Already surfaced per-account where possible; the run simply ends —
-            # readiness criterion 8 is about ONE ACCOUNT never stopping the rest,
-            # not about a whole-run network failure being invisible. The next
+            # the guarantee this program makes is that ONE account failing never
+            # stops the rest, not that a whole-run network failure is invisible.
+            # The next
             # click of «Обновить» retries the whole run.
             pass
 
@@ -353,14 +444,63 @@ class AgentWindow:
         self.root.after(_POLL_INTERVAL_MS, self._poll_queue)
 
     # -----------------------------------------------------------------
+    # Periodic sync timer — MAIN THREAD ONLY (a `root.after` timer callback,
+    # exactly like `_poll_queue` above — see the module docstring's cross-thread
+    # discipline section).
+    # -----------------------------------------------------------------
+    def _schedule_periodic_sync(self) -> None:
+        """
+        Schedules the NEXT hourly tick via `root.after`, using
+        `agent.constants.SYNC_INTERVAL_SECONDS` converted to milliseconds — never
+        a literal. Called once from `__init__` for the very first tick, and
+        again by `_on_periodic_tick` itself after every subsequent tick, so the
+        timer keeps running for as long as this window stays open.
+
+        The first tick fires a full interval AFTER launch, never AT launch: the
+        window's own startup already triggers the first sync run (the person's own
+        first «Обновить» click, or the terminal-check phase already visible when
+        the window opens), and scheduling a second one immediately would make two
+        overlapping runs the very first thing this program does on every single
+        launch.
+
+        Runs regardless of whether autostart is enabled or how the program was
+        launched — see `agent/constants.py`'s own docstring for why the timer is
+        deliberately NOT tied to the autostart checkbox: tying them together would
+        produce a state impossible to explain to a user (the program open,
+        visible, working, and syncing nothing because a checkbox whose meaning is
+        "start me on login" happens to be unticked).
+        """
+        self.root.after(_SYNC_INTERVAL_MS, self._on_periodic_tick)
+
+    def _on_periodic_tick(self) -> None:
+        """
+        Fires once per `agent.constants.SYNC_INTERVAL_SECONDS`. Reuses the
+        EXISTING in-flight guard (`self._sync_in_flight`) rather than any
+        timer-local state: if a sync is already running — whether started by a
+        manual «Обновить» click or a previous tick — this tick performs no sync
+        and starts no thread (no queue entry, no second `threading.Thread`); it
+        only reschedules. When idle, it calls through `_on_refresh_clicked` rather
+        than duplicating that method's thread-start logic, so there remains
+        exactly ONE place in this whole file that ever starts a sync worker
+        thread.
+
+        Always reschedules itself via `_schedule_periodic_sync()`, whether or not
+        THIS particular tick ran a sync — the timer must never silently stop just
+        because one tick found a sync already in flight.
+        """
+        if not self._sync_in_flight:
+            self._on_refresh_clicked()
+        self._schedule_periodic_sync()
+
+    # -----------------------------------------------------------------
     # Shutdown
     # -----------------------------------------------------------------
     def _on_close(self) -> None:
         """
         Shuts the terminal CONNECTION down — never the terminal process itself —
         so a run in flight does not leave the terminal attached after this window
-        closes. This never restores a previous session; D-23 already established
-        that this program never does that.
+        closes. This never restores a previous session — this program never does
+        that, on any exit path.
         """
         try:
             mt5_bridge.shutdown_terminal()
@@ -379,9 +519,83 @@ class _SyncFinishedSentinel:
     """
 
 
+@dataclass(frozen=True)
+class WindowLaunchOptions:
+    """
+    The command line's ENTIRE contribution to how this window starts, and by design
+    this dataclass must never carry more than that. `minimized` affects ONLY the
+    window's initial visual state (iconified vs. normal) — never "skip the
+    terminal check in background", never "behave differently while minimized",
+    never any second meaning. `agent/tests/test_main_args.py` asserts
+    `dataclasses.fields(WindowLaunchOptions)` has length 1 for exactly this
+    reason: a second field here is how that constraint erodes, one
+    plausible-looking addition at a time, and the moment a background mode exists
+    it will inevitably be tested worse than the foreground one — nobody watches
+    the window that isn't shown.
+
+    Deliberately carries NO string field, and never should. The token, the base
+    URL, and every other parameter this program needs come from
+    `agent/config_store.py`'s `config.json` alone. Passing any of them through
+    argv would put a secret or a server address on the process command line,
+    visible to any other process on the machine that can enumerate command
+    lines — a strictly worse exposure than the file they already live in.
+    """
+
+    minimized: bool = False
+
+
+def parse_argv(argv: "list[str]") -> "WindowLaunchOptions":
+    """
+    Parses this process's own command-line arguments (conventionally
+    `sys.argv[1:]`) into the single boolean this program ever derives from them.
+    Every argument other than the one recognised flag — an unknown flag, a bare
+    word, a `key=value` pair, an empty string, a flag that merely starts with the
+    same prefix — is ignored silently. This function never raises.
+
+    Deliberately NOT `argparse`: argparse's default behaviour on an unrecognised
+    argument is to print a usage message and call `sys.exit(2)`, which directly
+    contradicts the requirement above that anything on the command line other than
+    the one recognised flag is ignored, never fatal — whatever launched this
+    program (a shortcut, Task Scheduler, a person's own typo) must never crash
+    it. A plain membership test over the argument list is the correct tool for
+    "recognise exactly one flag, ignore everything else, never raise". Do not
+    "improve" this into argparse; that reintroduces the exact failure mode this
+    function exists to avoid.
+    """
+    return WindowLaunchOptions(minimized=autostart.MINIMIZED_FLAG in argv)
+
+
 def main() -> None:
+    """
+    Acquires the single-instance lock BEFORE any other work — before `parse_argv`,
+    before `AgentWindow` is constructed, and therefore before
+    `config_store.load_token()`, the token decrypt, and
+    `terminal_discovery.find_terminal_path()` (both reached inside
+    `AgentWindow.__init__`). A second process that gets far
+    enough to touch either the config file or the MT5 terminal can corrupt another
+    account's history silently, with no error raised anywhere in that sequence —
+    so the lock must gate every one of those calls, not merely run alongside them.
+
+    When the lock is not acquired, this function raises the first instance's
+    window (best-effort — see `single_instance.raise_existing_window()`'s own
+    docstring for why it may still return `False`) and returns WITHOUT
+    constructing `AgentWindow` at all. Returning here — never `sys.exit(1)` —
+    is deliberate: the person clicked a shortcut, and the correct outcome is
+    that the window they already have comes forward, with the process exiting 0.
+    Closing silently or exiting non-zero would both read as "it didn't work".
+    """
+    if not single_instance.acquire_single_instance_lock():
+        single_instance.raise_existing_window()
+        return
+
+    options = parse_argv(sys.argv[1:])
+
     root = tk.Tk()
     AgentWindow(root)
+    # Applied here, and nowhere else — see WindowLaunchOptions's own docstring for
+    # why this is the flag's only effect.
+    if options.minimized:
+        root.iconify()
     root.mainloop()
 
 

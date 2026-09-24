@@ -5,7 +5,7 @@ Nothing here imports MetaTrader5; every code is passed as a plain int, matching 
 `agent/mt5_bridge.py`'s `last_error_tuple()` output is expected to be unpacked by its
 caller before reaching this module.
 
-Plan 39-20 (39-CONTEXT.md D-33): the sustained-failure `broker_closed` heuristic that
+The sustained-failure `broker_closed` heuristic that
 used to live in `classify_outcome()` is DELETED, not merely unfed — see
 `agent/errors.py`'s own comment on the AUTH_FAILED branch for why. This file's job
 changed to match: instead of exercising the heuristic's three guard conditions (the
@@ -86,7 +86,7 @@ def test_algotrading_disabled_category_returns_its_own_outcome():
 
 
 # ---------------------------------------------------------------------------
-# classify_outcome can NEVER return "broker_closed" — structural proof (D-33)
+# classify_outcome can NEVER return "broker_closed" — structural proof
 # ---------------------------------------------------------------------------
 # Covers one representative code per real ErrorCategory (AUTH_FAILED, TIMEOUT,
 # ALGOTRADING_DISABLED, CONNECTION_ERROR), plus an unknown code and a `None`
@@ -136,5 +136,5 @@ def test_classify_outcome_can_never_return_broker_closed_for_any_input():
             f"login_succeeded={login_succeeded!r}, error_code={error_code!r}, "
             f"consecutive_auth_failures={consecutive_auth_failures!r}, "
             f"has_synced_successfully_before={has_synced_successfully_before!r} "
-            "— the heuristic must be gone, not merely unfed (D-33)"
+            "— the heuristic must be gone, not merely unfed"
         )

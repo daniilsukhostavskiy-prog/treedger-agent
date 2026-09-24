@@ -9,8 +9,8 @@ importable and testable on any machine.
 
 Deliberately NOT ported from mt5-service/tests/conftest.py: the Fernet-key fixture and
 the anchor-enabled fixture. Neither concept exists in this folder — the agent has no
-encrypted local credential store and no shared-terminal anchor/keeper logic (see
-39-CONTEXT.md D-23 and the mt5_bridge.py port exclusions in 39-PATTERNS.md).
+local encrypted credential store and no shared-terminal anchor/keeper logic (see
+`agent/mt5_bridge.py`'s own module docstring for the full port-exclusion list).
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def stub_mt5_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     Install a minimal stub `MetaTrader5` module into sys.modules for tests that want to
     exercise bridge-style code paths without a real terminal or the real pip package
     installed. Not used by agent/tests/test_positions.py (which is pure-Python and never
-    imports MetaTrader5 at all) — reserved for later plans that port mt5_bridge.py.
+    imports MetaTrader5 at all) — used by agent/tests/test_mt5_bridge.py instead.
     """
     stub = types.ModuleType("MetaTrader5")
     monkeypatch.setitem(sys.modules, "MetaTrader5", stub)

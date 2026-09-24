@@ -1,9 +1,9 @@
 """
 agent/sync.py — the per-account sync pipeline, PORTED (stripped) from
 `mt5-service/scheduler/daily_sync.py::sync_one_account` (the donor stays in the tree
-untouched — PHASE-LOCAL-SYNC-SPEC.md §9).
+untouched).
 
-WHAT IS PORTED, AND WHY (39-PATTERNS.md's own assignment for this file)
+WHAT IS PORTED, AND WHY
 -------------------------------------------------------------------------
 - Step 0's defensive validation of the login and the broker-server string, BEFORE MT5
   is ever touched. The donor's own comment explains why in production terms: a
@@ -35,8 +35,8 @@ WHAT IS PORTED, AND WHY (39-PATTERNS.md's own assignment for this file)
 WHAT IS DELIBERATELY NOT PORTED, AND WHY
 -------------------------------------------------------------------------
 - The per-account cutoff column and its filter step. This program neither reads nor
-  writes that column at all (39-CONTEXT.md D-04/D-05) — every sync pulls the account's
-  complete broker history, unconditionally.
+  writes that column at all — every sync pulls the account's
+  complete broker history, unconditionally, with no truncation.
 - The chain-lock acquisition around the donor's login-to-write chain. That lock exists
   because the donor's ONE terminal process is shared across many users' concurrent
   login chains on an always-on VPS. This program has exactly one user, one terminal,
@@ -54,27 +54,28 @@ WHAT IS DELIBERATELY NOT PORTED, AND WHY
   equivalent here; the server's own per-account state tracking (driven by the outcome
   this module reports) is what replaces it.
 
-THE agent-SIDE broker_closed HEURISTIC IS DELIBERATELY NEVER TRIGGERED FROM HERE
+THIS PROGRAM NEVER PRODUCES A `broker_closed` OUTCOME, BY CONSTRUCTION
 -------------------------------------------------------------------------
-`agent/errors.py::classify_outcome()` can produce the `broker_closed` outcome, but
-only when BOTH `has_synced_successfully_before` is `True` AND
-`consecutive_auth_failures` has crossed `LOGIN_FAILURE_THRESHOLD` — both of which are
-CROSS-RUN state this program has nowhere to keep: `agent/config_store.py` holds
-exactly a token and a base URL, nothing per-account, and the `/api/agent/accounts`
-response carries no failure-history field either. This module therefore always calls
-`classify_outcome()` with `consecutive_auth_failures=0,
-has_synced_successfully_before=False` — which, by that function's own documented
-rule, can never resolve to anything but the plain `auth_failed` outcome (or
-`timeout`/`server_unavailable`/`algotrading_disabled` for the other categories) from
-this call site. This is a real, intentional scoping decision, not an oversight: the
-server already implements an equivalent sustained-failure safety net independently
+`agent/errors.py::classify_outcome()` can only ever return one of six outcomes —
+`ok`, `auth_failed`, `server_unavailable`, `timeout`, `algotrading_disabled`, or
+`internal` — and `broker_closed` is not one of them; the type this program's own
+`ErrorCategory` enum uses has no such member at all, so no return value from this
+call site can ever carry that meaning. `classify_outcome()` still accepts
+`consecutive_auth_failures`/`has_synced_successfully_before` as parameters, always
+called here with `consecutive_auth_failures=0, has_synced_successfully_before=False`,
+but they are accepted-and-ignored — a leftover shape from a sustained-failure
+heuristic that was deliberately deleted outright, not merely left unfed (see
+`agent/errors.py`'s own comment on that branch for the full reasoning). This is a
+real, intentional scoping decision, not an oversight: the server already implements
+an equivalent sustained-failure safety net independently
 (`src/lib/api/agent/ingest.server.ts`'s `AUTH_FAILED_DEACTIVATE_THRESHOLD`, which
 deactivates an account after repeated `auth_failed` reports via its own
 `disconnect_reason='sync_failure'` path) — a different value, on a different column,
 but the same protective shape, applied server-side where cross-run state already
-lives. Teaching this program its own agent-side `broker_closed` verdict would require
-persisting a new piece of per-account failure history locally, which is out of this
-plan's scope; 39-CONTEXT.md's own R-01 remains open exactly as documented there.
+lives. The only path to `broker_closed` at all is the owner's own explicit action in
+their own browser session — never inferred here, and never accepted here even if an
+agent token tried to report it (the server refuses that outcome from an agent token
+as a security boundary).
 """
 from __future__ import annotations
 
@@ -114,7 +115,7 @@ class AccountProgress:
     outcome: Optional[str] = None
     error_reason: Optional[str] = None
     # Set only on the one PHASE_TERMINAL_CHECK event, to `{"login": int, "server":
-    # str}` when a session was ALREADY active in the terminal at startup (D-23), or
+    # str}` when a session was ALREADY active in the terminal at startup, or
     # `None` when it was not. The GUI pins its persistent notice off this field.
     pre_existing_session: Optional[dict] = None
 
@@ -439,8 +440,8 @@ def sync_one_account(client: api_client.ApiClient, account: dict, report: Report
 
 def run_sync(client: api_client.ApiClient, report: ReportFn) -> RunSummary:
     """
-    Run one full sync: initialise the terminal, check for a pre-existing session
-    (D-23), fetch this run's account list (persisting the rotated token IMMEDIATELY),
+    Run one full sync: initialise the terminal, check for a pre-existing session,
+    fetch this run's account list (persisting the rotated token IMMEDIATELY),
     then walk every account sequentially via `sync_one_account` — which never raises,
     so one account's failure can never stop the loop over the rest.
 
@@ -454,7 +455,7 @@ def run_sync(client: api_client.ApiClient, report: ReportFn) -> RunSummary:
     if not mt5_bridge.initialize_terminal():
         raise SyncAbortedError("MetaTrader 5 terminal failed to initialize")
 
-    # D-23 — read whatever account is ALREADY logged in, before this program logs
+    # Read whatever account is ALREADY logged in, before this program logs
     # into anything itself. No login restore, no second terminal instance — only a
     # persistent notice for the GUI to pin for the rest of the run.
     pre_existing_session = mt5_bridge.current_logged_in_account()
@@ -470,7 +471,8 @@ def run_sync(client: api_client.ApiClient, report: ReportFn) -> RunSummary:
     fetch_result = client.fetch_accounts()
     # Persist the rotated token IMMEDIATELY — the server has already rotated by the
     # time fetch_accounts() returns, and a crash between the two is exactly what the
-    # D-26 grace window exists to survive.
+    # server's grace window (see agent/api_client.py's AccountsFetchResult docstring)
+    # exists to survive.
     config_store.save_token(fetch_result.token)
 
     summary = RunSummary(total=len(fetch_result.accounts))

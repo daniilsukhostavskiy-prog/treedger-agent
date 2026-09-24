@@ -1,7 +1,6 @@
 """
-agent/tests/test_sync.py — every `<behavior>` bullet for `agent/sync.py`
-(39-14-PLAN.md Task 2), plus the structural self-audit of the whole `agent/` folder
-(Task 3).
+agent/tests/test_sync.py — the test coverage for `agent/sync.py`,
+plus the structural self-audit of the whole `agent/` folder.
 
 `agent.mt5_bridge`'s module-level functions are monkeypatched directly (the same
 technique `agent/tests/test_mt5_bridge.py` already uses for other module-level
@@ -566,8 +565,552 @@ def test_build_account_stats_payload_handles_null_first_trade_at() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Task 3 — structural self-audit of the whole agent/ folder
+# Task 3 — structural self-audit of the whole agent/ folder, plus 40-13's five
+# additional claims and its ast-based rewrite of three pre-existing
+# text-search siblings that shared the exact same defect as
+# `test_no_process_kill_call` (see that method's own docstring below for the
+# concrete history).
 # ---------------------------------------------------------------------------
+
+
+class _FunctionScopeVisitor(ast.NodeVisitor):
+    """
+    Shared base for every visitor below that needs to know not just THAT a
+    construct exists, but WHICH function it lives inside. Tracks the
+    innermost enclosing `FunctionDef`/`AsyncFunctionDef` node as a stack;
+    `None` means module scope.
+    """
+
+    def __init__(self) -> None:
+        self._stack: "list[ast.AST]" = []
+
+    def _current_function(self) -> "Optional[ast.AST]":
+        return self._stack[-1] if self._stack else None
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+        self._stack.append(node)
+        self.generic_visit(node)
+        self._stack.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+        self._stack.append(node)
+        self.generic_visit(node)
+        self._stack.pop()
+
+
+def _function_label(func_node: "Optional[ast.AST]") -> str:
+    return getattr(func_node, "name", None) or "<module scope>"
+
+
+def _find_top_level_function(tree: ast.Module, name: str) -> "Optional[ast.AST]":
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    return None
+
+
+def _docstring_constant_ids(tree: ast.Module) -> "set[int]":
+    """
+    `id()` of every string `Constant` node that is an actual module/class/
+    function docstring — the bare-string `Expr` that is the FIRST statement
+    of its enclosing body. Used so a check can ignore prose that names a
+    forbidden construct in order to explain the rule against it, without
+    ignoring the SAME literal string used as real code elsewhere (e.g. a list
+    element passed to `subprocess.run`).
+    """
+    ids: "set[int]" = set()
+    containers: "list[ast.AST]" = [tree]
+    containers.extend(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    )
+    for container in containers:
+        body = getattr(container, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            ids.add(id(first.value))
+    return ids
+
+
+class _StringConstantVisitor(_FunctionScopeVisitor):
+    """
+    Every string `Constant` node equal to `value`, tagged with its enclosing
+    function, EXCLUDING the docstring-position constants named in
+    `docstring_ids` — so a docstring that names the forbidden value in prose
+    is invisible to this visitor, verified by a dedicated negative test
+    rather than merely assumed.
+    """
+
+    def __init__(self, value: str, docstring_ids: "set[int]") -> None:
+        super().__init__()
+        self._value = value
+        self._docstring_ids = docstring_ids
+        self.matches: "list[tuple[ast.AST, Optional[ast.AST]]]" = []
+
+    def visit_Constant(self, node: ast.Constant) -> None:  # noqa: N802
+        if (
+            isinstance(node.value, str)
+            and node.value == self._value
+            and id(node) not in self._docstring_ids
+        ):
+            self.matches.append((node, self._current_function()))
+        self.generic_visit(node)
+
+
+# ---- order-sending MT5 API surface (converted from a text search) ---------
+
+_ORDER_SENDING_ATTRS = {"order_send", "order_check", "order_calc_margin", "order_calc_profit"}
+
+
+def _order_sending_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    offenders: "list[str]" = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in _ORDER_SENDING_ATTRS:
+                offenders.append(f"{path}:{node.lineno} references .{node.attr}(...)")
+    return offenders
+
+
+# ---- TLS verification bypass (converted from a text search) ---------------
+
+
+def _is_false_constant(node: "Optional[ast.AST]") -> bool:
+    return isinstance(node, ast.Constant) and node.value is False
+
+
+def _assign_targets(node: "ast.AST") -> "list[ast.AST]":
+    if isinstance(node, ast.Assign):
+        return node.targets
+    if isinstance(node, ast.AnnAssign) and node.target is not None:
+        return [node.target]
+    return []
+
+
+def _target_name(node: "ast.AST") -> "Optional[str]":
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _tls_bypass_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    offenders: "list[str]" = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    if kw.arg == "verify" and _is_false_constant(kw.value):
+                        offenders.append(f"{path}:{node.lineno} passes verify=False")
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)) and _is_false_constant(
+                getattr(node, "value", None)
+            ):
+                for target in _assign_targets(node):
+                    if _target_name(target) == "verify":
+                        offenders.append(f"{path}:{node.lineno} assigns verify = False")
+    return offenders
+
+
+# ---- process-kill call (the defect 40-13 exists to fix) -------------------
+
+_KILL_CALL_ATTRS = {"kill", "pthread_kill"}
+_KILL_STRING_SUBSTRING = "taskkill"
+
+
+def _process_kill_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    offenders: "list[str]" = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        docstring_ids = _docstring_constant_ids(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                attr = (
+                    func.attr
+                    if isinstance(func, ast.Attribute)
+                    else (func.id if isinstance(func, ast.Name) else None)
+                )
+                if attr in _KILL_CALL_ATTRS:
+                    offenders.append(
+                        f"{path}:{node.lineno} calls a process-kill function ({attr}(...))"
+                    )
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if id(node) in docstring_ids:
+                    continue
+                if _KILL_STRING_SUBSTRING in node.value.lower():
+                    offenders.append(
+                        f"{path}:{node.lineno} string constant contains "
+                        f"{_KILL_STRING_SUBSTRING!r}"
+                    )
+    return offenders
+
+
+# ---- the stored token is never read as plaintext ---------------------------
+
+_TOKEN_KEY_IDENTIFIER = "_KEY_TOKEN"
+
+
+def _is_token_key_reference(node: "Optional[ast.AST]") -> bool:
+    return isinstance(node, ast.Name) and node.id == _TOKEN_KEY_IDENTIFIER
+
+
+class _TokenKeyReadVisitor(_FunctionScopeVisitor):
+    """
+    Every READ (never a write) of the token config key: a `Load`-context
+    subscript, or a `.get(...)` call, keyed by the `_KEY_TOKEN` identifier —
+    deliberately never the bare literal `"token"`, which `agent/api_client.py`
+    also uses for an unrelated HTTP response field. Matching only the
+    identifier is what keeps this check from false-positiving on that
+    unrelated, legitimate code — the same word, two unrelated meanings, and
+    only the actual reference disambiguates them.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads: "list[tuple[ast.AST, Optional[ast.AST]]]" = []
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:  # noqa: N802
+        key = node.slice
+        if isinstance(node.ctx, ast.Load) and _is_token_key_reference(key):
+            self.reads.append((node, self._current_function()))
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "get"
+            and node.args
+            and _is_token_key_reference(node.args[0])
+        ):
+            self.reads.append((node, self._current_function()))
+        self.generic_visit(node)
+
+
+def _assigned_name_for(func_node: "Optional[ast.AST]", read_node: ast.AST) -> "Optional[str]":
+    """The bare name a read expression is directly assigned to, e.g. `raw` in
+    `raw = data.get(_KEY_TOKEN)` — `None` if the read is not a direct,
+    single-target assignment (the only shape the real loader uses)."""
+    if func_node is None:
+        return None
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Assign) and node.value is read_node:
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                return node.targets[0].id
+    return None
+
+
+def _first_decrypt_call_lineno(func_node: "Optional[ast.AST]") -> "Optional[int]":
+    """The earliest line, if any, on which `func_node` calls something whose
+    attribute name is `unprotect` (the one decrypt entry point)."""
+    if func_node is None:
+        return None
+    linenos = [
+        node.lineno
+        for node in ast.walk(func_node)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "unprotect"
+    ]
+    return min(linenos) if linenos else None
+
+
+def _returns_raw_before_decrypting(
+    func_node: "Optional[ast.AST]", read_node: ast.AST, assigned_name: "Optional[str]"
+) -> bool:
+    """True when `func_node` returns the read expression itself, or the bare
+    name it was assigned to, at or before the first decrypt call — or when no
+    decrypt call exists in the function at all."""
+    if func_node is None:
+        return False
+    decrypt_lineno = _first_decrypt_call_lineno(func_node)
+    if decrypt_lineno is None:
+        return True
+    for node in ast.walk(func_node):
+        if isinstance(node, ast.Return) and node.value is not None:
+            is_raw_directly = node.value is read_node
+            is_raw_by_name = (
+                assigned_name is not None
+                and isinstance(node.value, ast.Name)
+                and node.value.id == assigned_name
+            )
+            if (is_raw_directly or is_raw_by_name) and node.lineno <= decrypt_lineno:
+                return True
+    return False
+
+
+def _plaintext_token_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    offenders: "list[str]" = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        visitor = _TokenKeyReadVisitor()
+        visitor.visit(tree)
+        for read_node, func_node in visitor.reads:
+            permitted_site = (
+                path.name == "config_store.py" and _function_label(func_node) == "load_token"
+            )
+            if not permitted_site:
+                offenders.append(
+                    f"{path}:{read_node.lineno} reads the token config key outside "
+                    f"config_store.load_token() (in {_function_label(func_node)})"
+                )
+                continue
+            assigned_name = _assigned_name_for(func_node, read_node)
+            if _returns_raw_before_decrypting(func_node, read_node, assigned_name):
+                offenders.append(
+                    f"{path}:{read_node.lineno} in load_token() reaches a return without "
+                    "first passing the value through dpapi.unprotect(...)"
+                )
+    return offenders
+
+
+# ---- no non-Windows branch ever hands back a value -------------------------
+
+
+def _references_platform(test_node: ast.AST) -> bool:
+    return any(
+        isinstance(node, ast.Attribute) and node.attr == "platform" for node in ast.walk(test_node)
+    )
+
+
+def _branch_returns_or_yields(branch: "list[ast.stmt]") -> "list[ast.AST]":
+    offenders: "list[ast.AST]" = []
+    for stmt in branch:
+        for node in ast.walk(stmt):
+            if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)):
+                offenders.append(node)
+    return offenders
+
+
+def _dpapi_fallback_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    offenders: "list[str]" = []
+    for path in files:
+        if path.name != "dpapi.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If) and _references_platform(node.test):
+                for branch_node in _branch_returns_or_yields(node.body) + _branch_returns_or_yields(
+                    node.orelse
+                ):
+                    offenders.append(
+                        f"{path}:{branch_node.lineno} a platform-examining `if` "
+                        f"(line {node.lineno}) returns/yields a value instead of only "
+                        "ever raising"
+                    )
+    return offenders
+
+
+# ---- the command line never sources a credential ---------------------------
+
+_PERMITTED_ARGV_SITES = {
+    ("main.py", "main"),
+    ("autostart.py", "own_executable_path"),
+}
+
+
+class _ArgvReferenceVisitor(_FunctionScopeVisitor):
+    """Every `sys.argv` reference (an `Attribute` node: `value=Name('sys')`,
+    `attr='argv'`), tagged with its enclosing function."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refs: "list[tuple[ast.AST, Optional[ast.AST]]]" = []
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:  # noqa: N802
+        if node.attr == "argv" and isinstance(node.value, ast.Name) and node.value.id == "sys":
+            self.refs.append((node, self._current_function()))
+        self.generic_visit(node)
+
+
+def _contains_subscript(node: ast.AST) -> "Optional[ast.Subscript]":
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Subscript):
+            return sub
+    return None
+
+
+def _argv_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    offenders: "list[str]" = []
+    for path in files:
+        # `agent/packaging/` is CI/build tooling (e.g. `assert_dpapi_executed.py`, a
+        # standalone junit-xml report checker invoked as `python
+        # packaging/assert_dpapi_executed.py <path>`) — it runs on a build server, is
+        # never imported by the `agent` package, and never ships inside the built
+        # executable. Its own `sys.argv` usage is a plain CLI-script argument, not a
+        # credential path into this PROGRAM, so it is out of scope for this claim —
+        # unlike `tests`, which `_agent_source_files()` itself already excludes for
+        # every check, `packaging` still needs scanning by the other eleven claims
+        # (e.g. no eval/exec), so the exclusion is scoped to this one check only.
+        if "packaging" in path.parts:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+        visitor = _ArgvReferenceVisitor()
+        visitor.visit(tree)
+        for ref_node, func_node in visitor.refs:
+            site = (path.name, _function_label(func_node))
+            if site not in _PERMITTED_ARGV_SITES:
+                offenders.append(
+                    f"{path}:{ref_node.lineno} references sys.argv outside a permitted site "
+                    f"(in {_function_label(func_node)})"
+                )
+
+        if path.name != "main.py":
+            continue
+        parse_argv = _find_top_level_function(tree, "parse_argv")
+        if parse_argv is None:
+            continue
+        for node in ast.walk(parse_argv):
+            if isinstance(node, ast.Return) and node.value is not None:
+                leak = _contains_subscript(node.value)
+                if leak is not None:
+                    offenders.append(
+                        f"{path}:{leak.lineno} parse_argv()'s return value indexes into an "
+                        "argument list directly instead of only testing membership"
+                    )
+    return offenders
+
+
+# ---- the autostart CREATE verb has exactly one home -------------------------
+
+_SCHEDULER_CREATE_VERB = "/Create"
+
+
+class _CreateTaskCallVisitor(_FunctionScopeVisitor):
+    """Every call whose target resolves to `autostart.create_task` — an
+    `Attribute` access, since every caller reaches it through the module."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: "list[tuple[ast.AST, Optional[ast.AST]]]" = []
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "create_task":
+            self.calls.append((node, self._current_function()))
+        self.generic_visit(node)
+
+
+def _create_task_call_sites(
+    files: "list[pathlib.Path]",
+) -> "list[tuple[pathlib.Path, ast.AST, Optional[ast.AST]]]":
+    sites: "list[tuple[pathlib.Path, ast.AST, Optional[ast.AST]]]" = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        visitor = _CreateTaskCallVisitor()
+        visitor.visit(tree)
+        for call_node, func_node in visitor.calls:
+            sites.append((path, call_node, func_node))
+    return sites
+
+
+def _scheduler_verb_constant_sites(
+    files: "list[pathlib.Path]",
+) -> "list[tuple[pathlib.Path, ast.AST, Optional[ast.AST]]]":
+    sites: "list[tuple[pathlib.Path, ast.AST, Optional[ast.AST]]]" = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        docstring_ids = _docstring_constant_ids(tree)
+        visitor = _StringConstantVisitor(_SCHEDULER_CREATE_VERB, docstring_ids)
+        visitor.visit(tree)
+        for node, func_node in visitor.matches:
+            sites.append((path, node, func_node))
+    return sites
+
+
+def _scheduler_create_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    offenders: "list[str]" = []
+
+    call_sites = _create_task_call_sites(files)
+    if len(call_sites) != 1:
+        offenders.append(
+            "expected exactly one call site for autostart.create_task(...), found "
+            f"{len(call_sites)}: " + ", ".join(f"{p}:{n.lineno}" for p, n, _ in call_sites)
+        )
+
+    verb_sites = _scheduler_verb_constant_sites(files)
+    if len(verb_sites) != 1:
+        offenders.append(
+            f"expected exactly one occurrence of the {_SCHEDULER_CREATE_VERB!r} scheduler "
+            f"verb constant, found {len(verb_sites)}: "
+            + ", ".join(f"{p}:{n.lineno}" for p, n, _ in verb_sites)
+        )
+    else:
+        verb_path, verb_node, verb_func = verb_sites[0]
+        if verb_path.name != "autostart.py" or _function_label(verb_func) != "create_task":
+            offenders.append(
+                f"{verb_path}:{verb_node.lineno} the {_SCHEDULER_CREATE_VERB!r} verb constant "
+                f"lives outside agent/autostart.py's create_task() "
+                f"(in {_function_label(verb_func)})"
+            )
+
+    return offenders
+
+
+# ---- the single-instance lock is always the first thing that happens ------
+
+_FORBIDDEN_PRE_LOCK_MODULES = {"config_store", "terminal_discovery", "mt5_bridge"}
+
+
+def _resolves_to_lock_acquire(call_node: ast.Call) -> bool:
+    func = call_node.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "acquire_single_instance_lock"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "single_instance"
+    )
+
+
+def _statement_index(func_node: ast.AST, call_node: ast.Call) -> "Optional[int]":
+    for index, stmt in enumerate(func_node.body):  # type: ignore[attr-defined]
+        for node in ast.walk(stmt):
+            if node is call_node:
+                return index
+    return None
+
+
+def _lock_ordering_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    offenders: "list[str]" = []
+    for path in files:
+        if path.name != "main.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        entry = _find_top_level_function(tree, "main")
+        if entry is None:
+            offenders.append(f"{path}: no top-level main() function found")
+            continue
+
+        positioned: "list[tuple[tuple[int, int, int], ast.Call]]" = []
+        for node in ast.walk(entry):
+            if isinstance(node, ast.Call):
+                stmt_index = _statement_index(entry, node)
+                if stmt_index is not None:
+                    positioned.append(((stmt_index, node.lineno, node.col_offset), node))
+        positioned.sort(key=lambda item: item[0])
+
+        if not positioned:
+            offenders.append(f"{path}: main() makes no calls at all")
+            continue
+
+        _first_pos, first_call = positioned[0]
+        if not _resolves_to_lock_acquire(first_call):
+            offenders.append(
+                f"{path}:{first_call.lineno} the first call main() makes is not "
+                "single_instance.acquire_single_instance_lock(...)"
+            )
+    return offenders
+
 
 class TestAgentFolderStructuralAudit:
     """
@@ -576,18 +1119,51 @@ class TestAgentFolderStructuralAudit:
     automatic rather than merely written down — a future PR that adds any of these
     constructs must fail THIS test before it can ever ship.
 
-    Import detection uses `ast` (never a raw substring grep) for the "no database
-    client" claim specifically, because a plain-text grep for `supabase` would
-    false-positive on `agent/positions.py`'s own pre-existing, unrelated code comment
-    that names the DONOR module `supabase_writer.py` by way of explaining a design
-    decision inherited from it — that comment is prose about another file in another
-    part of the repository, not a database-client import in THIS one, and flagging it
-    would be exactly the "gate matches prose, not behaviour" failure mode this
-    project's own verification-integrity rule calls out. Every other claim below is
-    checked with a plain, case-insensitive text search, since a legitimate PROSE
-    match for e.g. "eval(" or "pickle" the developer intended to write literally is
-    vanishingly unlikely and no such match exists in this folder as of this test's
-    writing.
+    Every claim below is decided by walking the actual `ast` of the source — never a
+    raw substring/line grep — because a text search matches the WORDS a rule uses to
+    STATE a prohibition as readily as a VIOLATION of it. Two concrete examples proved
+    this the hard way: a plain-text grep for "supabase" would false-positive on
+    `agent/positions.py`'s own pre-existing, unrelated code comment that names a donor
+    module elsewhere in the repository by way of explaining a design decision inherited
+    from it; and an earlier, line-based version of the process-kill check below matched
+    the literal words "taskkill" and ".kill(" inside a docstring in
+    `agent/autostart.py` that was explaining, in prose, why that module has nothing to
+    do with killing a process. Both are the same failure mode: the artifact getting
+    bent to satisfy the check instead of the check being made to read what the code
+    actually DOES. The twelve claims this class enforces:
+
+    1. No listening/serving construct is imported anywhere (`socket`,
+       `socketserver`, `http.server`).
+    2. No dynamic-execution construct is called anywhere (`eval`, `exec`).
+    3. No unsafe deserialization construct is imported or invoked anywhere
+       (`pickle`, `marshal`, an unguarded `yaml.load`/`yaml.unsafe_load`).
+    4. No order-placing MT5 API surface is ever referenced
+       (`order_send`/`order_check`/`order_calc_margin`/`order_calc_profit`).
+    5. No database client is imported, and no `service_role`-named identifier
+       appears, anywhere in this folder.
+    6. No TLS certificate-verification bypass (`verify=False`, or an
+       assignment of `False` to a variable/attribute named `verify`) exists
+       anywhere.
+    7. No call that ends another process (`.kill(...)`, `os.kill(...)`,
+       `signal.pthread_kill(...)`, or the literal `taskkill` string outside a
+       docstring) exists anywhere.
+    8. The persisted authentication token is read from disk in exactly one
+       place, and that read's value always passes through the DPAPI decrypt
+       call before it can be returned — never handed back as plaintext.
+    9. The DPAPI module may refuse to operate on a non-Windows platform, but
+       neither branch of a platform check may ever return or yield a value —
+       only raise.
+    10. The command line is read to build the window's own launch options in
+        exactly two narrow, documented, non-credential shapes; nothing else
+        in the tree reads it, and the launch-options builder itself never
+        extracts a raw command-line element into a string field.
+    11. The Windows Task Scheduler CREATE verb — and the one function that
+        issues it — each appear in exactly one place in the whole tree, and
+        that place is the same single function.
+    12. The single-instance lock is the very first call the program's entry
+        point makes — before the command line is parsed, before the
+        configuration file is touched, and before the GUI toolkit's own root
+        window is constructed.
     """
 
     @staticmethod
@@ -647,19 +1223,43 @@ class TestAgentFolderStructuralAudit:
                                 offenders.append(f"{path}:{node.lineno} unsafe yaml.{func.attr}(...)")
         assert not offenders, f"unsafe deserialization construct found: {offenders}"
 
-    def test_no_order_sending_mt5_api_surface(self) -> None:
-        forbidden_attrs = {"order_send", "order_check", "order_calc_margin", "order_calc_profit"}
-        offenders: list[str] = []
-        for path in self._agent_source_files():
-            text = path.read_text(encoding="utf-8")
-            for lineno, line in enumerate(text.splitlines(), start=1):
-                stripped = line.strip()
-                if stripped.startswith("#"):
-                    continue
-                for attr in forbidden_attrs:
-                    if attr in line:
-                        offenders.append(f"{path}:{lineno} contains {attr!r}")
+    def test_no_order_sending_mt5_api_surface(self, tmp_path: pathlib.Path) -> None:
+        """
+        AST-based (converted from a line-based text search in this same plan that fixed
+        the process-kill check below): flags an actual `Attribute` node named for one of
+        MT5's four order-placing API calls, never a prose mention in a comment or
+        docstring — this module never sends an order, and a text search over these exact
+        identifier strings would trip on a docstring that quotes one of them to explain
+        why it is forbidden. An attribute name simply cannot appear as an `Attribute`
+        AST node from inside a string constant, so no explicit docstring exclusion is
+        even needed here — unlike the process-kill check, which must also catch a bare
+        string literal.
+        """
+        offenders = _order_sending_offenders(self._agent_source_files())
         assert not offenders, f"order-sending MT5 API surface found: {offenders}"
+
+        violation_dir = tmp_path / "violation"
+        violation_dir.mkdir()
+        violation = violation_dir / "evil.py"
+        violation.write_text(
+            "import MetaTrader5 as mt5\n\n"
+            "def place_order():\n"
+            "    return mt5.order_send({})\n",
+            encoding="utf-8",
+        )
+        assert _order_sending_offenders([violation]), "a real order_send(...) call must be reported"
+
+        safe_dir = tmp_path / "safe"
+        safe_dir.mkdir()
+        safe = safe_dir / "safe.py"
+        safe.write_text(
+            '"""This module never calls order_send, order_check, order_calc_margin or '
+            'order_calc_profit."""\n'
+            "def noop():\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+        assert not _order_sending_offenders([safe]), "a docstring mention must not be reported"
 
     def test_no_database_client(self) -> None:
         """
@@ -684,7 +1284,11 @@ class TestAgentFolderStructuralAudit:
         assert not offenders, f"database client import found: {offenders}"
 
         # A `service_role`-named identifier is still checked as plain text (never
-        # expected to appear in legitimate prose in this folder, unlike "supabase").
+        # expected to appear in legitimate prose in this folder, unlike "supabase") —
+        # deliberately left as a text search: the whole point of this specific
+        # sub-check is that even a PROSE mention of `service_role` in this folder is
+        # itself suspicious enough to want visibility, the opposite of the
+        # docstring-false-positive problem the rest of this class guards against.
         service_role_offenders: list[str] = []
         for path in self._agent_source_files():
             for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -692,26 +1296,336 @@ class TestAgentFolderStructuralAudit:
                     service_role_offenders.append(f"{path}:{lineno}")
         assert not service_role_offenders, f"service_role reference found: {service_role_offenders}"
 
-    def test_no_tls_verification_bypass(self) -> None:
-        offenders: list[str] = []
-        for path in self._agent_source_files():
-            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-                stripped = line.strip()
-                if stripped.startswith("#"):
-                    continue
-                if "verify" in line and "=" in line and "false" in line.lower():
-                    offenders.append(f"{path}:{lineno}: {line.strip()}")
+    def test_no_tls_verification_bypass(self, tmp_path: pathlib.Path) -> None:
+        """
+        AST-based (converted from a line-based text search in this same plan that fixed
+        the process-kill check below): flags an actual `verify=False` call keyword or a
+        `verify = False` assignment, never a prose mention — the previous version
+        matched any non-comment line containing the words "verify", "=" and "false"
+        together, which a docstring instructing readers never to add `verify=False`
+        (exactly the kind of sentence `agent/api_client.py`'s own TLS docstring already
+        contains, one keyword short of tripping it) would itself have matched.
+        """
+        offenders = _tls_bypass_offenders(self._agent_source_files())
         assert not offenders, f"TLS verification bypass found: {offenders}"
 
-    def test_no_process_kill_call(self) -> None:
-        forbidden_snippets = ("taskkill", ".kill(", "os.kill", "signal.pthread_kill")
-        offenders: list[str] = []
-        for path in self._agent_source_files():
-            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-                stripped = line.strip()
-                if stripped.startswith("#"):
-                    continue
-                for snippet in forbidden_snippets:
-                    if snippet in line:
-                        offenders.append(f"{path}:{lineno} contains {snippet!r}")
+        violation_dir = tmp_path / "violation"
+        violation_dir.mkdir()
+        violation = violation_dir / "evil.py"
+        violation.write_text(
+            "import requests\n\n"
+            "def fetch():\n"
+            "    return requests.get('https://example.com', verify=False)\n",
+            encoding="utf-8",
+        )
+        assert _tls_bypass_offenders([violation]), "a real verify=False call must be reported"
+
+        safe_dir = tmp_path / "safe"
+        safe_dir.mkdir()
+        safe = safe_dir / "safe.py"
+        safe.write_text(
+            '"""Never pass verify=False to a request in this file — that would disable '
+            'TLS certificate verification."""\n'
+            "def fetch():\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+        assert not _tls_bypass_offenders([safe]), "a docstring mention must not be reported"
+
+    def test_no_process_kill_call(self, tmp_path: pathlib.Path) -> None:
+        """
+        The specific defect this plan exists to fix. The previous version of this check
+        grepped every non-`#`-comment line for the literal substrings "taskkill",
+        ".kill(", "os.kill" and "signal.pthread_kill" — and it matched those same
+        substrings inside a docstring in `agent/autostart.py` that was explaining, in
+        prose, why that module has nothing to do with killing a process. That is the
+        general failure mode this whole class exists to avoid: a forbidden-construct
+        list must be able to CONTAIN the forbidden words, so a text search matches the
+        rule's own documentation as readily as a violation of it. This version instead
+        walks actual `Call` nodes whose target attribute/name is `kill` or
+        `pthread_kill` (covers `proc.kill()`, `os.kill(...)`,
+        `signal.pthread_kill(...)`, and `Process(pid).kill()` alike), plus actual
+        string-`Constant` nodes containing "taskkill" that are NOT a module/class/
+        function docstring — proven below to still catch a real kill call while
+        leaving a docstring's own prose alone.
+        """
+        offenders = _process_kill_offenders(self._agent_source_files())
         assert not offenders, f"process-kill call found: {offenders}"
+
+        violation_dir = tmp_path / "violation"
+        violation_dir.mkdir()
+        violation = violation_dir / "evil.py"
+        violation.write_text(
+            "import os\n\n"
+            "def stop_other_process(pid):\n"
+            "    os.kill(pid, 9)\n",
+            encoding="utf-8",
+        )
+        assert _process_kill_offenders([violation]), "a real os.kill(...) call must be reported"
+
+        safe_dir = tmp_path / "safe"
+        safe_dir.mkdir()
+        safe = safe_dir / "safe.py"
+        safe.write_text(
+            '"""\n'
+            "This module never issues taskkill, never calls .kill( on anything, never\n"
+            "calls os.kill and never calls signal.pthread_kill — it only manages Windows\n"
+            "Task Scheduler entries, never a running process.\n"
+            '"""\n'
+            "def noop():\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+        assert not _process_kill_offenders([safe]), "a docstring mention must not be reported"
+
+    # -----------------------------------------------------------------------
+    # 40-13 — five new claims this phase makes about the source.
+    # -----------------------------------------------------------------------
+
+    def test_no_plaintext_token_read_path(self, tmp_path: pathlib.Path) -> None:
+        """
+        The stored authentication token is ciphertext on disk; the ONLY place this
+        program ever reads the config file's `token` key is `config_store.load_token()`,
+        and that read's value must pass through `dpapi.unprotect(...)` before
+        `load_token()` can return it. This is a DATAFLOW claim — "does the value that
+        was just read reach a `return` without being decrypted first?" — that no amount
+        of careful prose or grepping for the word "token" could ever decide, and
+        "token" itself is the wrong word to search for regardless: `agent/api_client.py`
+        legitimately reads an entirely UNRELATED `"token"` field out of an HTTP response
+        body, so only matching the `_KEY_TOKEN` identifier — never the bare literal —
+        keeps this check from false-positiving on that unrelated code. Only walking the
+        actual `Assign`/`Call`/`Return` shape around the read answers the real question.
+        """
+        offenders = _plaintext_token_offenders(self._agent_source_files())
+        assert not offenders, f"plaintext token read path found: {offenders}"
+
+        outside_reader_dir = tmp_path / "outside_reader"
+        outside_reader_dir.mkdir()
+        outside_reader = outside_reader_dir / "leaky.py"
+        outside_reader.write_text(
+            "_KEY_TOKEN = 'token'\n\n"
+            "def read_it(data):\n"
+            "    return data.get(_KEY_TOKEN)\n",
+            encoding="utf-8",
+        )
+        assert _plaintext_token_offenders([outside_reader]), (
+            "a token-key read outside config_store.load_token() must be reported"
+        )
+
+        plaintext_loader_dir = tmp_path / "plaintext_loader"
+        plaintext_loader_dir.mkdir()
+        plaintext_loader = plaintext_loader_dir / "config_store.py"
+        plaintext_loader.write_text(
+            "_KEY_TOKEN = 'token'\n\n"
+            "def load_token():\n"
+            "    data = {}\n"
+            "    raw = data.get(_KEY_TOKEN)\n"
+            "    return raw\n",
+            encoding="utf-8",
+        )
+        assert _plaintext_token_offenders([plaintext_loader]), (
+            "a load_token() that returns the raw value without decrypting it must be reported"
+        )
+
+    def test_no_non_windows_dpapi_fallback(self, tmp_path: pathlib.Path) -> None:
+        """
+        `agent/dpapi.py` may refuse to store/read a token off Windows, but it may never
+        HAND BACK a value on that path — no XOR, no baked-key AES, no "obfuscation"
+        masquerading as encryption. The module's own deferred-check shape (the platform
+        test lives INSIDE a function body, never at import time, so the module still
+        imports cleanly on a non-Windows dev/CI machine) is fine and permitted; what is
+        checked here is only whether a platform-examining `if`'s branches ever reach a
+        `return`/`yield` at all. Deciding "does this branch hand back a value" requires
+        walking the branch's actual statements — a text search for the word "platform"
+        or "Windows" would say nothing about what the branch DOES.
+        """
+        offenders = _dpapi_fallback_offenders(self._agent_source_files())
+        assert not offenders, f"non-Windows DPAPI fallback found: {offenders}"
+
+        violation_dir = tmp_path / "violation"
+        violation_dir.mkdir()
+        violation = violation_dir / "dpapi.py"
+        violation.write_text(
+            "import sys\n\n"
+            "def protect(plaintext):\n"
+            "    if not sys.platform.startswith('win'):\n"
+            "        return plaintext\n"
+            "    return b'real-ciphertext'\n",
+            encoding="utf-8",
+        )
+        assert _dpapi_fallback_offenders([violation]), (
+            "a non-Windows branch that returns a value must be reported"
+        )
+
+        safe_dir = tmp_path / "safe"
+        safe_dir.mkdir()
+        safe = safe_dir / "dpapi.py"
+        safe.write_text(
+            "import sys\n\n"
+            "class DpapiUnavailableError(Exception):\n"
+            "    pass\n\n"
+            "def protect(plaintext):\n"
+            "    if not sys.platform.startswith('win'):\n"
+            "        raise DpapiUnavailableError('no DPAPI here')\n"
+            "    return b'real-ciphertext'\n",
+            encoding="utf-8",
+        )
+        assert not _dpapi_fallback_offenders([safe]), (
+            "a non-Windows branch that only raises must not be reported"
+        )
+
+    def test_no_argv_sourced_credential(self, tmp_path: pathlib.Path) -> None:
+        """
+        Neither the token, nor the base URL, nor any other parameter this program needs
+        is ever sourced from `sys.argv` — its only source is the config file
+        (`agent/main.py`'s own `WindowLaunchOptions` docstring states this constraint
+        explicitly: passing a secret through argv would put it on the process command
+        line, visible to any other process on the machine that can enumerate command
+        lines). `sys.argv` is legitimately referenced in exactly two places in this
+        runtime PROGRAM (the `agent` package plus its own entry point), for two
+        narrow, non-credential purposes: `main()` passes `sys.argv[1:]` into
+        `parse_argv()` (which this check further constrains to return only a value
+        built from boolean literals/comparisons, never an indexed element), and
+        `agent/autostart.py`'s `own_executable_path()` reads `sys.argv[0]` — the
+        running process's OWN path, never a user-supplied parameter. A third
+        reference anywhere in the `agent` package, or a `parse_argv()` that indexes
+        into the argument list instead of only testing membership, is an offender.
+        `agent/packaging/` is excluded from this specific claim: it is CI/build
+        tooling that runs on a build server, is never imported by the `agent`
+        package, and never ships inside the built executable — its own CLI-script
+        argument handling is not a credential path into the program this claim is
+        about, and it stays in scope for the other eleven claims. Neither "how many
+        places" nor "does this expression index into a list" is a question a text
+        search over the word "argv" can answer.
+        """
+        offenders = _argv_offenders(self._agent_source_files())
+        assert not offenders, f"argv-sourced credential path found: {offenders}"
+
+        third_site_dir = tmp_path / "third_site"
+        third_site_dir.mkdir()
+        third_site = third_site_dir / "leaky.py"
+        third_site.write_text(
+            "import sys\n\n"
+            "def read_server_url():\n"
+            "    return sys.argv[1]\n",
+            encoding="utf-8",
+        )
+        assert _argv_offenders([third_site]), "a third sys.argv reference must be reported"
+
+        leaky_parse_dir = tmp_path / "leaky_parse"
+        leaky_parse_dir.mkdir()
+        leaky_parse = leaky_parse_dir / "main.py"
+        leaky_parse.write_text(
+            "import sys\n\n"
+            "class WindowLaunchOptions:\n"
+            "    def __init__(self, base_url=None):\n"
+            "        self.base_url = base_url\n\n"
+            "def parse_argv(argv):\n"
+            "    return WindowLaunchOptions(base_url=argv[0])\n\n"
+            "def main():\n"
+            "    parse_argv(sys.argv[1:])\n",
+            encoding="utf-8",
+        )
+        assert _argv_offenders([leaky_parse]), (
+            "a parse_argv() that indexes into argv to build a string field must be reported"
+        )
+
+    def test_scheduler_creation_has_exactly_one_call_site(self, tmp_path: pathlib.Path) -> None:
+        """
+        `agent/autostart.py`'s `create_task()` is the ONLY function in this whole
+        program that issues the Windows Task Scheduler CREATE verb, and it is called
+        from exactly one place (the autostart checkbox's own handler in
+        `agent/main.py`) — never from the silent startup self-check. A program that can
+        write itself into Windows autostart from more than one code path behaves like
+        malware; this makes that structurally impossible rather than merely
+        conventional. The verb is collected as a string-`Constant` NODE, never a text
+        match, specifically so a comment or docstring that NAMES the verb (to explain
+        this very rule, as this docstring itself does) is invisible to it — proven
+        below, not merely asserted.
+        """
+        offenders = _scheduler_create_offenders(self._agent_source_files())
+        assert not offenders, f"scheduler-creation call-site claim violated: {offenders}"
+
+        second_caller_dir = tmp_path / "second_caller"
+        second_caller_dir.mkdir()
+        second_caller = second_caller_dir / "rogue.py"
+        second_caller.write_text(
+            "from agent import autostart\n\n"
+            "def self_register():\n"
+            "    autostart.create_task()\n",
+            encoding="utf-8",
+        )
+        real_call_site_dir = tmp_path / "real_call_site"
+        real_call_site_dir.mkdir()
+        real_call_site = real_call_site_dir / "main.py"
+        real_call_site.write_text(
+            "from agent import autostart\n\n"
+            "def _on_autostart_toggled():\n"
+            "    autostart.create_task()\n",
+            encoding="utf-8",
+        )
+        create_task_home_dir = tmp_path / "create_task_home"
+        create_task_home_dir.mkdir()
+        create_task_home = create_task_home_dir / "autostart.py"
+        create_task_home.write_text(
+            "def create_task():\n"
+            "    verb = '/Create'\n"
+            "    return verb\n",
+            encoding="utf-8",
+        )
+        assert _scheduler_create_offenders(
+            [second_caller, real_call_site, create_task_home]
+        ), "a second autostart.create_task() call site must be reported"
+
+        comment_plus_real_dir = tmp_path / "comment_plus_real"
+        comment_plus_real_dir.mkdir()
+        comment_plus_real = comment_plus_real_dir / "autostart.py"
+        comment_plus_real.write_text(
+            "# This module's OTHER function never issues /Create; only create_task()\n"
+            "# does, exactly once below.\n"
+            "def repair_task_path():\n"
+            "    return None\n\n"
+            "def create_task():\n"
+            "    verb = '/Create'\n"
+            "    return verb\n",
+            encoding="utf-8",
+        )
+        verb_sites = _scheduler_verb_constant_sites([comment_plus_real])
+        assert len(verb_sites) == 1, (
+            "a comment mentioning the verb must not be counted alongside the one real "
+            f"occurrence: {verb_sites}"
+        )
+
+    def test_single_instance_lock_precedes_any_work(self, tmp_path: pathlib.Path) -> None:
+        """
+        `agent/main.py`'s `main()` acquires the single-instance lock BEFORE any other
+        call it makes — before `parse_argv`, before the Tk root is constructed, and
+        therefore before `AgentWindow.__init__` ever reaches `config_store.load_token()`
+        or `terminal_discovery.find_terminal_path()`. A second process that gets far
+        enough to touch either the config file or the MT5 terminal can corrupt another
+        account's history silently, with no error raised anywhere in that sequence — so
+        the lock must gate every one of those calls, not merely run alongside them. This
+        is a statement-ORDER property within the parsed function body: the check sorts
+        every `Call` node `main()` makes by (top-level-statement index, line, column)
+        and asserts the very first one resolves to
+        `single_instance.acquire_single_instance_lock(...)` — an ordering question no
+        text search can even pose, let alone answer.
+        """
+        offenders = _lock_ordering_offenders(self._agent_source_files())
+        assert not offenders, f"single-instance lock does not precede other work: {offenders}"
+
+        violating_dir = tmp_path / "violating"
+        violating_dir.mkdir()
+        violating_main = violating_dir / "main.py"
+        violating_main.write_text(
+            "from agent import config_store, single_instance\n\n"
+            "def main():\n"
+            "    token = config_store.load_token()\n"
+            "    if not single_instance.acquire_single_instance_lock():\n"
+            "        return\n"
+            "    return token\n",
+            encoding="utf-8",
+        )
+        assert _lock_ordering_offenders([violating_main]), (
+            "a config_store call reached before the lock must be reported"
+        )

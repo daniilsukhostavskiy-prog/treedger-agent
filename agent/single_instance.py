@@ -1,9 +1,9 @@
 """
 agent/single_instance.py — a per-user, per-session named-mutex guard so a second copy
 of this program launched while the first is still running does not corrupt another
-account's history in the same MT5 terminal (40-CONTEXT.md D-25).
+account's history in the same MT5 terminal.
 
-WHY THIS EXISTS (D-25)
+WHY THIS EXISTS
 --------------------------------------------------------------------------
 Before this phase's autostart feature, two running copies of this program were rare.
 After it, they become everyday: the program sits minimised in the taskbar, the person
@@ -19,7 +19,7 @@ The contract for a second instance is therefore NOT "exit silently" — the pers
 the shortcut, saw nothing happen, and will click it again, thinking it did not register.
 The second instance must bring the FIRST instance's window to the front, so the click
 visibly did something, and only THEN exit with code 0. That exit-0 wiring itself lands
-in `agent/main.py` in a later plan (40-10) — this module only provides the two
+in `agent/main.py` — this module only provides the two
 primitives `main.py` calls before doing anything else.
 
 WHY A NAMED MUTEX, NOT A LOCK FILE
@@ -29,8 +29,9 @@ process terminates, for ANY reason — clean exit, crash, or a forced kill from 
 Manager. A PID or lock file on disk has no such guarantee: if the process that created
 it dies abnormally, the file survives, and every later launch would see it and refuse to
 start — forever, unless the program grows a "maybe this file is stale" heuristic. This
-project has already refused that exact class of heuristic elsewhere (39-CONTEXT.md
-D-29..D-36 refuse to infer `broker_closed` from a failure count) — a stale-lock guess is
+project has already refused that exact class of heuristic elsewhere (`agent/errors.py`
+refuses to infer `broker_closed` from a failure count, for the same reason) — a
+stale-lock guess is
 one more decision this program is not equipped to make reliably, so it does not try. The
 mutex sidesteps the whole class of problem: nothing to go stale.
 
@@ -38,21 +39,22 @@ WHY `Local\\` NOT `Global\\`
 --------------------------------------------------------------------------
 `Global\\` names live in a machine-wide kernel object namespace and, on some Windows
 configurations, require the `SeCreateGlobalPrivilege` right to create — the wrong scope
-for a program that deliberately never asks for administrator rights (D-13). `Local\\`
+for a program that deliberately never asks for administrator rights. `Local\\`
 (the per-session namespace) is visible only within the caller's own Terminal
 Services/logon session, which is exactly right: this program only needs to detect a
 second copy the SAME logged-in user just launched, never a copy started by a different
 Windows user on the same machine — a scenario this program's threat model does not
 otherwise consider either (see the accepted limitation below).
 
-ACCEPTED LIMITATION (T-40-04-05, disposition: accept)
+ACCEPTED LIMITATION (documented, not engineered around)
 --------------------------------------------------------------------------
 `MUTEX_NAME` is a fixed, guessable string. A malicious local process running as the same
 Windows user could pre-create a mutex with this exact name before this program ever
 launches, which would make `acquire_single_instance_lock()` always report "another
 instance is already running" and block this program from starting at all. For this
-program's threat model — a single-digit user base, and no adversarial local-process
-scenario modelled anywhere else in this phase's threat register either — this is an
+program's threat model — a single-digit user base, and no other adversarial
+same-user-local-process scenario considered a real risk anywhere else in this program —
+this is an
 accepted, low-severity, documented limitation, not something to engineer around with
 e.g. a randomized or per-install mutex name (which would then need to be persisted
 somewhere, reopening exactly the "where do we safely store one more value" question
@@ -155,14 +157,14 @@ def raise_existing_window() -> bool:
     foreground call itself reported success. NEVER raises — every Windows API failure
     along this path degrades to False, because a second instance that cannot raise the
     first instance's window must still exit cleanly; this function's only job is a
-    best effort, and its caller (agent/main.py, plan 40-10) exits 0 regardless of the
+    best effort, and its caller (`agent/main.py`) exits 0 regardless of the
     return value.
 
-    Honest caveat (40-RESEARCH.md Pattern 2 / assumption A3 — LIKELY, not proven in
-    this sandbox): Windows' foreground-lock restriction means a background process
+    Honest caveat — LIKELY, not proven on real hardware yet:
+    Windows' foreground-lock restriction means a background process
     calling `SetForegroundWindow` on an unrelated window is not guaranteed to succeed,
-    even with the `AttachThreadInput` sequence below. This is verified on real
-    hardware at the human checkpoint in plan 40-15. If it is observed to fail there,
+    even with the `AttachThreadInput` sequence below. This still needs confirming on
+    a real machine with a real interactive desktop session. If it is observed to fail there,
     `FlashWindow` (flashing the taskbar icon) is the documented, strictly weaker but
     more reliable fallback — deliberately not implemented here yet, since it should
     not be added speculatively ahead of that empirical result.

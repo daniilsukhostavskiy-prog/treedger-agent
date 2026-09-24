@@ -52,9 +52,9 @@ class _FakeUser32:
 
     Does NOT cover: real Windows foreground-lock behaviour — whether
     `SetForegroundWindow` actually succeeds from a background process on a live,
-    interactive desktop session (40-RESEARCH.md assumption A3, LIKELY but not proven in
-    this sandbox). That is verified on real hardware at the human checkpoint in plan
-    40-15.
+    interactive desktop session (LIKELY but not proven in
+    this sandbox). That still needs confirming on a real machine with a real
+    interactive desktop session.
     """
 
     def __init__(
@@ -200,9 +200,8 @@ def test_mutex_handle_never_explicitly_closed() -> None:
     This is a source-level (static) guarantee, not a runtime behavioural assertion:
     there is no way to observe "the fake int handle was never closed" via the stubs
     above, since closing (or not closing) a plain Python int has no observable effect.
-    Labeled WEAK in 40-04-SUMMARY.md for exactly that reason — this is the only
-    mechanism available for this particular claim, per the task's own acceptance
-    criteria.
+    A deliberately weak guarantee, for exactly that reason — this is the only
+    mechanism available for this particular claim.
     """
     source_path = pathlib.Path(__file__).resolve().parent.parent / "single_instance.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))

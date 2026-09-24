@@ -1,10 +1,14 @@
 """
-agent/tests/test_api_client.py — every `<behavior>` bullet for `agent/api_client.py`
-(39-14-PLAN.md Task 1). `requests` is stubbed throughout — no network is ever touched.
+agent/tests/test_api_client.py — the test coverage for `agent/api_client.py`,
+including the 426 `protocol_too_old`
+refusal and the diagnostic build-version header. `requests` is stubbed throughout —
+no network is ever touched.
 """
 from __future__ import annotations
 
+import ast
 import json
+import pathlib
 from typing import Any, Optional
 
 import pytest
@@ -70,7 +74,7 @@ def test_fetch_accounts_sends_bearer_token_and_protocol_header(fake_requests) ->
 
     call = session.calls[0]
     assert call["headers"]["Authorization"] == "Bearer tok_old"
-    assert call["headers"]["X-Agent-Protocol"] == str(api_client.AGENT_PROTOCOL_VERSION)
+    assert call["headers"][api_client.HEADER_AGENT_PROTOCOL] == str(api_client.AGENT_PROTOCOL_VERSION)
 
 
 def test_redeem_pairing_code_sends_no_authorization_header(fake_requests) -> None:
@@ -81,7 +85,29 @@ def test_redeem_pairing_code_sends_no_authorization_header(fake_requests) -> Non
 
     call = session.calls[0]
     assert "Authorization" not in call["headers"]
-    assert call["headers"]["X-Agent-Protocol"] == str(api_client.AGENT_PROTOCOL_VERSION)
+    assert call["headers"][api_client.HEADER_AGENT_PROTOCOL] == str(api_client.AGENT_PROTOCOL_VERSION)
+
+
+def test_every_request_carries_both_the_protocol_and_build_version_headers(fake_requests) -> None:
+    """Every request's headers include both the protocol header and the diagnostic
+    build-version header, with non-empty values — inspects the dict `_headers()`
+    returns directly."""
+    client = api_client.ApiClient("https://treedger.com", token="tok_old")
+
+    headers = client._headers(authorized=True)
+
+    assert headers[api_client.HEADER_AGENT_PROTOCOL] == str(api_client.AGENT_PROTOCOL_VERSION)
+    assert isinstance(headers[api_client.HEADER_BUILD_VERSION], str)
+    assert headers[api_client.HEADER_BUILD_VERSION] != ""
+
+
+def test_protocol_header_value_is_the_string_form_of_the_transcribed_protocol_integer() -> None:
+    client = api_client.ApiClient("https://treedger.com")
+
+    headers = client._headers(authorized=False)
+
+    assert headers[api_client.HEADER_AGENT_PROTOCOL] == str(api_client.AGENT_PROTOCOL_VERSION)
+    assert isinstance(api_client.AGENT_PROTOCOL_VERSION, int)
 
 
 def test_redeem_pairing_code_returns_the_token(fake_requests) -> None:
@@ -133,12 +159,43 @@ def test_fetch_accounts_on_429_without_retry_after_header_still_raises(fake_requ
     assert exc_info.value.retry_after_seconds is None
 
 
-def test_protocol_refusal_raises_agent_protocol_error(fake_requests) -> None:
+def test_protocol_refusal_raises_agent_protocol_error_with_status_426(fake_requests) -> None:
+    """A response with status 426 and a body whose error field is the too-old code
+    raises `AgentProtocolError` carrying status 426."""
+    fake_requests([_FakeResponse(426, json_body={"error": "protocol_too_old"})])
+    client = api_client.ApiClient("https://treedger.com", token="tok_old")
+
+    with pytest.raises(api_client.AgentProtocolError) as exc_info:
+        client.fetch_accounts()
+    assert exc_info.value.status_code == 426
+
+
+def test_stale_400_protocol_response_no_longer_raises_agent_protocol_error(fake_requests) -> None:
+    """An earlier response shape (400, {"error": "protocol"}) must NOT raise
+    `AgentProtocolError` any more — proving the rename to the 426/`protocol_too_old`
+    shape completed rather than being additive. It falls through to the generic
+    error path instead."""
     fake_requests([_FakeResponse(400, json_body={"error": "protocol"})])
     client = api_client.ApiClient("https://treedger.com", token="tok_old")
 
-    with pytest.raises(api_client.AgentProtocolError):
+    with pytest.raises(api_client.AgentApiError) as exc_info:
         client.fetch_accounts()
+    assert not isinstance(exc_info.value, api_client.AgentProtocolError)
+    assert exc_info.value.status_code == 400
+
+
+def test_426_with_non_json_body_still_raises_agent_protocol_error_not_a_parse_failure(
+    fake_requests,
+) -> None:
+    """A 426 response with a non-JSON body still raises `AgentProtocolError`, not a
+    JSON-parse failure — the server refusing an old client must be recognisable even
+    when its body is unusable."""
+    fake_requests([_FakeResponse(426, raw_text="<html>not json</html>")])
+    client = api_client.ApiClient("https://treedger.com", token="tok_old")
+
+    with pytest.raises(api_client.AgentProtocolError) as exc_info:
+        client.fetch_accounts()
+    assert exc_info.value.status_code == 426
 
 
 def test_other_error_status_raises_plain_agent_api_error(fake_requests) -> None:
@@ -301,3 +358,34 @@ def test_every_request_carries_a_connect_and_read_timeout(fake_requests) -> None
 
     assert "timeout" in session.calls[0]
     assert isinstance(session.calls[0]["timeout"], tuple)
+
+
+# ---------------------------------------------------------------------------
+# Structural: AGENT_BUILD_VERSION is never read inside a conditional.
+# ---------------------------------------------------------------------------
+
+def test_no_conditional_node_in_module_reads_the_build_version_constant() -> None:
+    """
+    Structural, not textual: parse this module's own source and assert
+    `AGENT_BUILD_VERSION`'s name never appears inside an `If`/`IfExp`/`Compare`
+    node anywhere in the file — the mechanical enforcement of the "diagnostic
+    fact, not a control value" rule (see `AGENT_BUILD_VERSION`'s own docstring in
+    `agent/api_client.py`). A text search would miss the
+    constant appearing as part of an expression inside a conditional; walking the
+    parsed AST does not.
+    """
+    source_path = pathlib.Path(api_client.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    offending_nodes = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.IfExp, ast.Compare)):
+            for sub_node in ast.walk(node):
+                if isinstance(sub_node, ast.Name) and sub_node.id == "AGENT_BUILD_VERSION":
+                    offending_nodes.append(node)
+
+    assert not offending_nodes, (
+        "AGENT_BUILD_VERSION must never be referenced inside a conditional node "
+        f"(found {len(offending_nodes)} offending node(s)) — it is a diagnostic "
+        "fact, not a control value."
+    )

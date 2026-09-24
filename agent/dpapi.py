@@ -5,8 +5,8 @@ Exposes exactly `protect(plaintext: bytes) -> bytes`, `unprotect(ciphertext: byt
 -> bytes`, and `DpapiUnavailableError`. Implemented with standard-library `ctypes`
 against `crypt32.dll`/`kernel32.dll` — `CryptProtectData`/`CryptUnprotectData` with
 `CRYPTPROTECT_UI_FORBIDDEN`, never anything else. No optional entropy parameter:
-DPAPI's own per-user session-key binding is the whole mechanism (D-19 does not
-require a second secret). Adds zero new entries to `agent/requirements.txt` — every
+DPAPI's own per-user session-key binding is the whole mechanism — a second secret is
+not needed on top of it. Adds zero new entries to `agent/requirements.txt` — every
 symbol used here is standard library.
 
 WHY NO NON-WINDOWS BRANCH EXISTS — READ BEFORE ADDING ONE
@@ -14,9 +14,10 @@ WHY NO NON-WINDOWS BRANCH EXISTS — READ BEFORE ADDING ONE
 Without DPAPI, this program refuses to store the token and says so, rather than
 storing it some other way. There is no XOR, no baked-key AES, no "obfuscation," no
 plaintext fallback — none of that is encryption, and pretending it is would be worse
-than admitting the token can't be stored on this platform (D-20's own framing: "a
-mechanism that creates a feeling of protection without providing it is worse than no
-mechanism").
+than admitting the token can't be stored on this platform: **a mechanism that creates
+a feeling of protection without providing it is worse than no mechanism** — the same
+principle behind this program's own honesty about not self-verifying its executable
+(see `agent/README.md`'s "What this program does not do" section).
 
 This file DOES import successfully on a non-Windows machine (the two functions below
 are still defined) — that import guard exists ONLY so the cross-platform part of the
@@ -25,8 +26,8 @@ test suite (and this repository's own non-Windows sandbox, matching
 crashing collection. Calling `protect()`/`unprotect()` off Windows raises
 `DpapiUnavailableError` immediately — never returns, never falls back, never encodes
 anything. The absence of a return-value fallback anywhere in this module is proven by
-the `ast` audit added in a later plan of this phase (40-13's structural extension to
-`TestAgentFolderStructuralAudit`), not by grepping this file for a word.
+the folder's own `ast`-based structural audit (`TestAgentFolderStructuralAudit` in
+`agent/tests/test_sync.py`), not by grepping this file for a word.
 
 THIS MODULE IS ALLOWED — REQUIRED — TO RAISE
 ----------------------------------------------------------------------------------
@@ -49,7 +50,7 @@ A token encrypted here becomes PERMANENTLY undecryptable if an administrator RES
 DPAPI's master key is itself wrapped with the user's own credential material, and an
 admin reset does not have that material to re-wrap it with. This is documented DPAPI
 behaviour, not a bug in this module, and there is nothing to "fix" here: the recovery
-path is the one D-19 already designed for any broken/discarded token — the user
+path is the same one already designed for any broken/discarded token — the user
 re-pairs. User-facing copy must never promise this "can't happen."
 
 Related, rarer edge case: under a ROAMING Windows profile, DPAPI-protected data is

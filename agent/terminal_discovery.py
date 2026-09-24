@@ -3,7 +3,7 @@ agent/terminal_discovery.py — locates the installed MetaTrader 5 terminal exec
 on the current Windows machine.
 
 THERE IS DELIBERATELY NO CONFIGURATION OPTION AND NO ENVIRONMENT-VARIABLE OVERRIDE for
-this path (PHASE-LOCAL-SYNC-SPEC.md §8). Do not add one back "for convenience" if a
+this path. Do not add one back "for convenience" if a
 future change makes this feel awkward. The donor service
 (mt5-service/services/mt5_bridge.py:267-271, `MT5_TERMINAL_PATH_ENV` +
 `_DEFAULT_MT5_TERMINAL_PATH`) reads an env var with a hardcoded fallback default — that
@@ -15,7 +15,7 @@ program at a different executable than the one the user actually installed. The
 Windows registry — specifically the same "Add/Remove Programs" (Uninstall) entries
 every installer writes — is the one source of truth this module trusts instead.
 
-Registry technique (39-RESEARCH.md Pitfall 3 / Open Question 3): no single documented
+Registry technique: no single documented
 MetaQuotes registry key was found for terminal discovery, and a broker-rebranded
 (white-label) MetaTrader 5 build — e.g. "FTMO MetaTrader 5", "RoboForex MetaTrader 5" —
 installs under its OWN product name in its OWN folder, producing its own Uninstall
@@ -30,8 +30,7 @@ reaching the 32-bit-vs-64-bit-redirected registry view at once, for both hives:
     technique `winreg`/the Win32 API itself recommend for reliably reaching a SPECIFIC
     view regardless of whether this Python interpreter itself is 32- or 64-bit), AND
   - the older, still-common convention of manually splicing a literal "WOW6432Node"
-    path segment into the subkey path (the technique 39-RESEARCH.md Pitfall 3 names
-    explicitly).
+    path segment into the subkey path.
 This is deliberate over-coverage, not a bug: since no single documented key exists,
 belt-and-suspenders costs nothing (duplicate hits across combinations are harmless —
 `find_terminal_path()` only needs the first candidate whose executable exists on disk)
@@ -67,9 +66,9 @@ class TerminalNotFoundError(Exception):
     Defined in this module (not in agent/mt5_bridge.py) so agent/main.py's GUI can
     import and catch this one stable symbol without depending on the MT5 bridge module
     at all. `find_terminal_path()` itself never raises this — it only ever returns
-    `None`. It is `agent/mt5_bridge.py`'s `initialize_terminal(path)` (a later plan)
-    that raises it, for the GUI to catch and show its blocking-but-non-crashing notice
-    (39-CONTEXT.md D-09 §12.2): «MetaTrader 5 не найден на этом компьютере».
+    `None`. It is `agent/mt5_bridge.py`'s `initialize_terminal(path)`
+    that raises it, for the GUI to catch and show its blocking-but-non-crashing notice:
+    «MetaTrader 5 не найден на этом компьютере».
     """
 
 
@@ -88,7 +87,7 @@ class RegistryCandidate(TypedDict):
 _TERMINAL_EXE_NAME = "terminal64.exe"
 
 # Case-insensitive substring every known MetaTrader 5 build's DisplayName carries,
-# including broker-rebranded builds (39-RESEARCH.md Pitfall 3).
+# including broker-rebranded builds.
 _DISPLAY_NAME_MARKER = "metatrader 5"
 
 # The two Uninstall-registry subkey path shapes: native, and the older

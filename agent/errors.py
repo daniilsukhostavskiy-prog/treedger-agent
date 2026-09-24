@@ -7,8 +7,9 @@ command). Every classification decision in this file traces back to that one tab
 `classify_login_error(code)` is a thin lookup. `classify_outcome(...)` maps one
 login/sync attempt onto one of the SIX outcomes an agent is ever allowed to report
 over the wire — never onto the system-wide seventh outcome, which is reserved for
-the owner's own browser session and can never be produced from this module (plan
-39-20, 39-CONTEXT.md D-33..D-36). See the comment on `classify_outcome()`'s
+the owner's own browser session (an explicit "this account is closed" action taken
+in their own browser, never inferred by this program) and can never be produced from
+this module. See the comment on `classify_outcome()`'s
 AUTH_FAILED branch for what used to live here and why it was deleted rather than
 merely left unused.
 
@@ -33,7 +34,7 @@ from agent.error_codes import DEFAULT_CATEGORY, MT5_ERROR_CODES, ErrorCategory
 # The six outcomes `classify_outcome()` may return — mirrors
 # src/lib/api/agent/contract.ts's AGENT_REPORTABLE_OUTCOMES verbatim. NOT the
 # same list as that file's AGENT_ACCOUNT_OUTCOMES, which additionally carries
-# a seventh, owner-only outcome no agent may ever report (plan 39-20). Do not
+# a seventh, owner-only outcome no agent may ever report. Do not
 # add, remove or rename a value here without touching that file too.
 # ---------------------------------------------------------------------------
 OUTCOME_OK = "ok"
@@ -85,7 +86,7 @@ def classify_outcome(
 
     if category is ErrorCategory.AUTH_FAILED:
         # --------------------------------------------------------------------
-        # REMOVED (plan 39-20, 39-CONTEXT.md D-29, D-33) — read before "fixing"
+        # REMOVED — read before "fixing"
         # this by feeding a real count into the two unused parameters above.
         #
         # This branch used to escalate to the `broker_closed` outcome once
@@ -103,28 +104,30 @@ def classify_outcome(
         # on the very next run.
         #
         # The heuristic is DELETED here, not merely left unfed by its one
-        # caller (`agent/sync.py`, frozen for this plan, which always passed
+        # caller (`agent/sync.py`, which always passes
         # `consecutive_auth_failures=0, has_synced_successfully_before=False`
         # into it regardless) — leaving dead-but-callable retirement logic
         # around is exactly the guarantee-by-convention the owner already
         # rejected one level down, at the error-code table itself
         # (`error_codes.py`'s `ErrorCategory` has no matching member either,
-        # by the same reasoning, since plan 39-07).
+        # by the same reasoning).
         #
         # `consecutive_auth_failures`/`has_synced_successfully_before` remain
         # as accepted-and-ignored parameters ONLY because `sync.py`'s single
-        # call site still passes them by keyword and is out of this plan's
-        # file list — a future plan that also owns `sync.py` should delete
+        # call site still passes them by keyword — a future change that also
+        # touches `sync.py` should delete
         # both the parameters and that call site's arguments together, in the
         # same change, for a clean signature.
         #
         # Account lifecycle now belongs entirely to the owner, exercised in
-        # their own browser session (`mark-closed/route.ts`, plan 39-19) —
+        # their own browser session (a dedicated "mark this account closed"
+        # route, reachable only from the owner's own logged-in session) —
         # never guessed here, and never appliable via an agent token either
-        # (`ingest.server.ts`'s `applyAccountSyncOutcome` refuses it even if
-        # somehow reported, plan 39-20). D-32 is the only path back: a live
-        # MT5 probe finding a code that reliably tells the two cases apart
-        # would be a NEW decision for the owner to make, not a reason to
+        # (the server-side ingest path refuses a `broker_closed` outcome
+        # reported by an agent token even if
+        # somehow attempted). The only path back is a live
+        # MT5 probe finding a code that reliably tells the two cases apart —
+        # that would be a NEW decision for the owner to make, not a reason to
         # quietly restore this. Git history holds the deleted implementation
         # and its tests verbatim if that day comes.
         # --------------------------------------------------------------------

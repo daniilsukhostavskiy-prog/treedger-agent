@@ -11,8 +11,8 @@ Why this exists now, without a live probe
 ------------------------------------------
 The owner CANCELLED the live MT5 probe outright, not deferred it: they trade from a
 phone, have no MetaTrader 5 installed and an empty registry, and the second
-developer — who does have a terminal — receives this code only once the phase is
-finished (`agent/probe_mt5.py` ships unrun; plan 39-17 hands it over). So this table
+developer — who does have a terminal — receives this code separately, with
+`agent/probe_mt5.py` shipped unrun for them to run themselves. So this table
 is written now, from the official MQL5 docs and from the donor's own observed
 production behaviour (`mt5-service/services/mt5_bridge.py`), and is structured so a
 later real probe can REFINE ONE TABLE and change nothing else: refining it means
@@ -30,7 +30,7 @@ heuristic on a previously-successful account, never a meaning any single error c
 can carry.
 
 The reason is an asymmetry, not a style preference: `broker_closed` stops polling an
-account FOREVER (39-CONTEXT.md D-01), while `auth_failed` merely causes a retry on
+account FOREVER, while `auth_failed` merely causes a retry on
 the next run. A code is therefore never evidence that an account is closed by
 itself — only a sustained pattern over time is, and that verdict lives in
 `errors.py`, never here. Consequently an unknown code, an ambiguous code, and any
@@ -51,7 +51,7 @@ the donor's production history.
 the one a future probe is EXPECTED to change, and inflating a row's confidence to
 make the table look more finished would only mean nobody re-checks it later.
 
-39-RESEARCH.md Pitfall 1 found this repo's own working classifier and the official
+Research found this repo's own working classifier and the official
 MQL5 docs assigning OPPOSITE meanings to the SAME numeric codes (`-6` is `IPC_FAILED`
 — connection-class — in the donor's production comments, but `RES_E_AUTH_FAILED` per
 the official docs page). Several rows below carry that conflict explicitly in their
@@ -150,8 +150,8 @@ MT5_ERROR_CODES: dict[int, ErrorCodeInfo] = {
             "IPC_FAILED (terminal-to-broker connection lost, connection-class) and "
             "has observed it live, but the official MQL5 docs page for "
             "last_error() names the SAME code RES_E_AUTH_FAILED — the OPPOSITE "
-            "meaning (39-RESEARCH.md Pitfall 1). Resolved toward CONNECTION_ERROR "
-            "here because the R-01 asymmetry rule requires an ambiguous code to "
+            "meaning. Resolved toward CONNECTION_ERROR "
+            "here because the asymmetry rule above requires an ambiguous code to "
             "fall on the recoverable side: CONNECTION_ERROR can never feed the "
             "broker_closed heuristic, while AUTH_FAILED can. This is a deliberate "
             "choice under genuine uncertainty, not a confirmed fact."
@@ -182,10 +182,10 @@ MT5_ERROR_CODES: dict[int, ErrorCodeInfo] = {
             "(mt5-service/services/mt5_bridge.py, filed under a 'wrong server' "
             "inline comment there), while the official MQL5 docs instead name -8 "
             "as RES_E_AUTO_TRADING_DISABLED and are silent on -10006 specifically "
-            "(39-RESEARCH.md Pitfall 1) — the two sources disagree with each other "
+            "— the two sources disagree with each other "
             "about which literal code carries this meaning. Kept here as "
-            "ALGOTRADING_DISABLED per 39-CONTEXT.md D-09 section 12.1's explicit "
-            "direction to give AUTO_TRADING_DISABLED its own branch; this row is an "
+            "ALGOTRADING_DISABLED per this program's own decision to give "
+            "AUTO_TRADING_DISABLED its own branch; this row is an "
             "honest assumption, not a confirmed fact, pending the second "
             "developer's probe run once with algo-trading off and once with it on."
         ),

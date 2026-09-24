@@ -1,7 +1,7 @@
 """
-agent/tests/test_config_store.py — every `<behavior>` bullet for
-`agent/config_store.py` (39-14-PLAN.md Task 1; extended by 40-03-PLAN.md Task 3 for
-DPAPI-backed token storage).
+agent/tests/test_config_store.py — the test coverage for
+`agent/config_store.py`, including
+DPAPI-backed token storage.
 """
 from __future__ import annotations
 
@@ -29,8 +29,8 @@ def _fake_dpapi(monkeypatch: pytest.MonkeyPatch) -> None:
     stand-in (byte-reversal) so every test in this file runs on any platform,
     regardless of whether real DPAPI is available in the current environment.
 
-    This substitution is exactly what D-20 says is NOT sufficient proof on its own —
-    it proves the LOGIC around the encryption layer (config_store's own branching),
+    This substitution is NOT sufficient proof on its own that DPAPI itself works —
+    it proves only the LOGIC around the encryption layer (config_store's own branching),
     never that the real Win32 DPAPI call itself works. That is why
     `agent/tests/test_dpapi.py`'s real-syscall round-trip test exists alongside this
     fixture, not instead of it: this fixture and that test cover two different
@@ -131,7 +131,7 @@ def test_config_path_lives_under_app_data_not_beside_the_program() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 40-03-PLAN.md Task 3 — the token on disk is ciphertext, never plaintext.
+# The token on disk is ciphertext, never plaintext.
 # ---------------------------------------------------------------------------
 
 def test_stored_token_value_is_not_the_plaintext_string() -> None:

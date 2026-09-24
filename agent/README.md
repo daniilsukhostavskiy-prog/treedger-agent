@@ -44,37 +44,108 @@ python -m pytest agent/tests/test_sync.py -k StructuralAudit -q
 ## Requirements
 
 - Windows, with MetaTrader 5 already installed and at least one account added to it.
-- Python installed from [python.org](https://www.python.org/downloads/) (this includes
-  `tkinter`, the GUI toolkit this program's window is built with — some other Python
-  distributions omit it).
 - The computer switched on and awake while the program runs — it does nothing while your
   machine is asleep or off.
+- Only if you run it from source rather than the released executable: Python installed
+  from [python.org](https://www.python.org/downloads/) (this includes `tkinter`, the GUI
+  toolkit this program's window is built with — some other Python distributions omit it).
 
-## How to run it (this phase)
+## Running it
+
+There are two ways to run this program. Most people want the first one.
+
+### The released executable
+
+Download the release archive from this repository's Releases page, unzip it, and run the
+`.exe` inside — see **Where it installs** and **Verifying what you downloaded** below
+before you run it for the first time. No Python installation is needed for this path; the
+executable is self-contained.
+
+### From source (for development)
 
 ```
 pip install -r agent/requirements.txt
-python agent/main.py
+python -m agent.main
 ```
 
-There is deliberately **no packaged executable, installer, code signing, autostart or
-tray icon** in this phase (see `PHASE-LOCAL-SYNC-SPEC.md` §9 and 39-CONTEXT.md D-24).
-Acceptance this phase is walked by running the script directly, exactly as above.
+`agent/` is a real Python package — launching `main.py` directly by its file path (rather
+than as a module) fails with `ModuleNotFoundError: No module named 'agent'`, because
+Python does not add the project root to its module search path when a file is launched
+that way. Always use the module-execution form above (`python -m agent.main`), run from
+the repository root.
+
+## Where it installs
+
+The released executable installs to `%LOCALAPPDATA%\Programs\TreedgerAgent` — a folder
+your own Windows account already owns. The program never needs, and never asks for,
+administrator rights, which means you can drop a new version in yourself, at any time,
+with no UAC elevation prompt.
+
+## Verifying what you downloaded
+
+A hash is published beside each release. Compare it against the file you downloaded
+before running it for the first time — that comparison, done once at first run, is the
+entire verification step this program relies on.
+
+## What this program does not do
+
+There is **no self-integrity check anywhere in the code**, and the program nowhere
+pretends to guard itself. Two ways of adding one were considered and rejected:
+
+- **Remembering the file's hash at the moment autostart is enabled.** Useless: a process
+  able to replace the `.exe` can rewrite whatever file is holding the remembered hash,
+  too.
+- **Checking the install folder's permissions.** Also useless: the folder above is always
+  writable by its own owner by design (that is what "no admin rights" means), so the
+  warning would be permanent, and a permanent warning stops being read within a week.
+
+The general rule behind both rejections: **a mechanism that creates a feeling of
+protection without providing it is worse than no mechanism — it obstructs sober
+assessment of the residual risk and spends the user's trust for nothing.**
+
+## The residual risk (read this)
+
+Any process running under your own Windows account can overwrite this program's `.exe`
+file, and turning on **Запускать вместе с Windows** (see below) makes such a substitution
+persistent — it would run again at every login, undetected. The program does not check
+for this and does not try to.
+
+Two things would close this gap, and both are deliberately deferred, not forgotten: an
+installer that places the program in a system-owned directory (which needs administrator
+rights to write to, unlike the per-user folder above), and code-signing the executable.
+
+## Autostart and periodic sync
+
+**Запускать вместе с Windows** (off by default) means exactly one thing: whether the
+program's window opens automatically when you log into Windows. It carries no second
+meaning — it does not change how often the program syncs, and it does not put the program
+into any special "background" mode; a minimised window is the exact same program, just
+iconified.
+
+The program syncs once an hour while its window is open, however it was launched —
+manually or via autostart.
+
+## Single instance
+
+If the program is already running and you start it again, the second copy brings the
+first one's window to the front and exits immediately. It never opens a second window and
+never starts a second connection to your MT5 terminal.
 
 ### First run, step by step
 
-1. Install the two things above: MetaTrader 5 (with at least one account already added to
-   it) and Python from python.org.
-2. `pip install -r agent/requirements.txt`
-3. In Treedger, open **Настройки → Аккаунт → Программа синхронизации** and press
+1. Install MetaTrader 5 (with at least one account already added to it), and get the
+   program by one of the two methods above.
+2. In Treedger, open **Настройки → Аккаунт → Программа синхронизации** and press
    **«Привязать программу»**. This generates a short-lived, single-use pairing code — no
-   port is opened on your computer and no browser redirect is ever accepted, which is
-   precisely why pairing works this way instead (39-CONTEXT.md D-25).
-4. Run `python agent/main.py`. A window opens asking for the server address (pre-filled)
-   and the pairing code.
-5. Paste the code and press **«Привязать»**. The program exchanges it for a real,
-   long-lived token, which it stores locally, and the window moves to the account list.
-6. Press **«Обновить»**. The program walks every one of your accounts one at a time,
+   port is ever opened on your computer to receive it, and no browser redirect is
+   accepted either; pasting the code into the program's own window is the only path in,
+   by design.
+3. Run the program. A window opens asking for the server address (pre-filled) and the
+   pairing code.
+4. Paste the code and press **«Привязать»**. The program exchanges it for a real,
+   long-lived token, which it stores locally, encrypted, and the window moves to the
+   account list.
+5. Press **«Обновить»**. The program walks every one of your accounts one at a time,
    showing each one's row update live.
 
 If MetaTrader 5 cannot be found on your computer at all, the window shows a plain,
@@ -96,7 +167,7 @@ Above the rows, a single overall progress line reads `Прогресс: done/tot
 `done` counts both successful AND failed accounts — a run with one failed account among
 several still reaches 100%, because that account has been walked, just not synced
 successfully. This is what makes it visible at a glance that one account's failure never
-stops the rest (readiness criterion 8).
+stops the rest.
 
 ## How to run the tests
 
@@ -104,16 +175,12 @@ stops the rest (readiness criterion 8).
 python -m pytest agent/tests -q
 ```
 
-This test root is independent of `mt5-service/tests/` (currently 82/82) — running the
-command above never runs, and never disturbs, that suite.
-
 ## Troubleshooting
 
 This section is written directly from `agent/error_codes.py` — the one table of every MT5
 error code this program knows anything about. That table honestly labels each of its own
 rows as **confirmed in practice** (observed live), **from the MQL5 docs**, or an
-**assumption** (inferred, not verified). No live probe against a real MetaTrader 5
-terminal has run yet at the time of this writing, so anything below drawn from an
+**assumption** (inferred, not verified). Anything below drawn from an
 `assumption`-labelled row is stated as unconfirmed, on purpose — inflating it to sound
 more certain than it is would only mean nobody double-checks it later.
 
@@ -143,8 +210,10 @@ the program checks whether an account was already logged into your terminal and,
 shows a persistent notice for the rest of the run: it switched to your other accounts to
 read them, and if you were working in that account yourself, you need to log back into it
 afterward. The program deliberately never restores your previous session and never opens
-a second, separate terminal instance to avoid this — both were considered and are out of
-scope for this phase (39-CONTEXT.md D-23).
+a second, separate terminal instance to avoid this — both were considered and rejected as
+out of scope: restoring a previous session silently is its own source of surprising
+behaviour, and a second terminal instance would double MetaTrader 5's own resource use for
+a case this notice already handles honestly.
 
 **A revoked or expired pairing code** — the pairing screen shows a plain error line and
 stays on the pairing screen; request a fresh code from Treedger and try again.
@@ -153,23 +222,10 @@ stays on the pairing screen; request a fresh code from Treedger and try again.
 refuses it), the window clears its locally stored token and returns to the pairing screen
 automatically the next time it tries to sync. Pair again with a fresh code to continue.
 
-## What this phase deliberately does not include
+## What this program deliberately does not include
 
-This is a scope decision (39-CONTEXT.md D-24, `PHASE-LOCAL-SYNC-SPEC.md` §9), not an
-oversight or something forgotten:
-
-- No packaged `.exe` — the program is run with `python agent/main.py` directly.
 - No installer.
 - No code signing.
-- No autostart registration (nothing adds itself to Windows startup).
-- No tray icon (the program only ever shows its one window).
+- No tray icon — the program only ever shows its one window (minimised or not).
 - No support for an account's live open positions — only closed-trade history is read
   and sent.
-
-## Moving this folder
-
-`agent/` is self-contained on purpose: its own dependency list
-(`agent/requirements.txt`), its own pytest configuration (`agent/pytest.ini`) and its
-own README (this file). It is expected to be lifted whole, unedited, into a future
-repository — see `PHASE-LOCAL-SYNC-SPEC.md` §3 and §10 for why this phase is being built
-inside the old repository at all.

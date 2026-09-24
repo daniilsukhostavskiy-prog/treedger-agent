@@ -1,21 +1,20 @@
 """
 agent/autostart.py — the per-user Windows Task Scheduler entry that makes «Запускать
-вместе с Windows» work, and the self-check that keeps it pointed at the right file
-(40-CONTEXT.md D-22, D-23).
+вместе с Windows» work, and the self-check that keeps it pointed at the right file.
 
-THE STRUCTURAL SPLIT IS THE WHOLE POINT OF THIS MODULE (D-22)
+THE STRUCTURAL SPLIT IS THE WHOLE POINT OF THIS MODULE
 --------------------------------------------------------------------------
-`repair_task_path()` — the function `agent/main.py` calls on EVERY start (a later plan,
-40-10) — may issue only the scheduler's QUERY and CHANGE verbs (`/Query`, `/Change`). It
+`repair_task_path()` — the function `agent/main.py` calls on EVERY start — may issue
+only the scheduler's QUERY and CHANGE verbs (`/Query`, `/Change`). It
 is structurally INCAPABLE of creating a task: when no task exists it returns without
 issuing the create verb, ever. `create_task()` is a completely separate function,
 reachable only from the explicit "Включить" autostart opt-in checkbox handler
-(`agent/main.py`, a later plan), and it is the ONLY function in this entire program that
+(`agent/main.py`), and it is the ONLY function in this entire program that
 issues the scheduler's CREATE verb (`/Create`).
 
 Why this split has to be structural, not a matter of convention: a program that writes
 itself into Windows autostart behaves EXACTLY like malware, and that must be impossible
-by construction, not merely avoided by discipline. Plan 40-13's `ast` audit asserts the
+by construction, not merely avoided by discipline. This folder's own `ast` audit asserts the
 literal `/Create` verb string appears inside exactly ONE function, tree-wide, across the
 whole `agent/` package — so a future edit that moves the create call into
 `repair_task_path()` (or anywhere else) cannot ship; the audit fails first.
@@ -30,7 +29,7 @@ response. Without this rule there would be a way to make this program register s
 ELSE for autostart — a substitute `.exe` an attacker controls, run every time the user
 logs in.
 
-CORRECTION IS SILENT (D-22)
+CORRECTION IS SILENT
 --------------------------------------------------------------------------
 `repair_task_path()` returns a short status string for LOGGING ONLY. It must never
 surface a dialog or a notice of any kind: the person made no mistake — the install
@@ -40,14 +39,14 @@ exactly the case where it does move (Windows then launches nothing, with no erro
 the person notices a week later via stale data); silently repairing the path on every
 start is the fix, and it deserves no dialog of its own.
 
-NO ADMIN RIGHTS, EVER (D-13 / 40-RESEARCH.md assumption A4)
+NO ADMIN RIGHTS, EVER
 --------------------------------------------------------------------------
 Every scheduler command below omits `/RU` (run-as-user — omitting it defaults to the
 CURRENTLY LOGGED-IN user) and never requests `/RL HIGHEST` (the elevated run level). A
 logon task (`/SC ONLOGON`) for the current user needs no UAC elevation with the default
-(`LIMITED`, i.e. standard-user) run level. This is **LIKELY but not proven in this
-sandbox** — 40-RESEARCH.md's assumption A4 — and it MUST be confirmed on the human
-checkpoint machine in plan 40-15. If elevation turns out to be required after all, that
+(`LIMITED`, i.e. standard-user) run level. This is **LIKELY but not proven in a
+non-interactive sandbox** — it needs confirming on a real machine with a real interactive
+desktop session. If elevation turns out to be required after all, that
 is a FINDING, not a bug to patch here: the whole autostart mechanism would need
 rethinking (e.g. a Startup-folder shortcut instead of Task Scheduler), because this
 program never asks for administrator rights under any circumstances.
@@ -61,11 +60,14 @@ quoting a shell would apply is not the same quoting Task Scheduler itself needs 
 path containing spaces, and mixing the two is how the `--minimized` flag would end up
 silently parsed as part of the path instead of as its own argument. Every verb this
 module issues manages the SCHEDULER's own record of what to launch (create, query,
-change, delete a task definition) — none of it ever targets a running process, so this
-module has nothing in common with the whole-folder structural audit's separate,
-already-guarded prohibition on ending another process outright
-(`agent/tests/test_sync.py::TestAgentFolderStructuralAudit`, the check named for that
-prohibition).
+change, delete a task definition) — none of it ever targets a running process. This
+module never shells out to `taskkill`, never calls `.kill(` on anything, and never
+touches `os.kill`/`signal.pthread_kill` — it has nothing in common with the
+whole-folder structural audit's separate, already-guarded prohibition on ending another
+process outright (`agent/tests/test_sync.py::TestAgentFolderStructuralAudit`'s
+`test_no_process_kill_call`, which is `ast`-based specifically so a sentence like this
+one — naming those exact words to explain why this module never does them — can never
+trip it).
 """
 from __future__ import annotations
 
@@ -78,7 +80,7 @@ TASK_NAME = "TreedgerAgent"
 """The one scheduled task this whole program ever creates, queries, changes, or deletes."""
 
 MINIMIZED_FLAG = "--minimized"
-"""The single command-line flag `agent/main.py` (a later plan, per D-23) recognises when
+"""The single command-line flag `agent/main.py` recognises when
 launched from Task Scheduler — it affects ONLY the window's initial state (minimised vs.
 normal) and nothing else. Defined here, next to `TASK_NAME`, since this module is the one
 place that writes it into the scheduled task's command line; `agent/main.py` imports it
@@ -86,7 +88,7 @@ from here rather than repeating the literal string."""
 
 _QUERY_TASK_TO_RUN_PREFIX = "Task To Run:"
 """The exact `schtasks /Query ... /FO LIST /V` output line prefix that carries the
-registered command string. 40-RESEARCH.md Pattern 3 notes `/XML` as a more robust
+registered command string. `schtasks /Query ... /XML` is a more robust
 machine-parseable alternative should this text format ever prove fragile to parse."""
 
 
@@ -149,8 +151,9 @@ def _build_command_line(exe_path: str) -> str:
     docstring). The DOUBLED quoting here is deliberate, not a mistake: the outer pair
     (the literal `"` characters in this f-string) is what Task Scheduler itself needs
     around a path that may contain spaces, so the `--minimized` flag that follows is
-    parsed as its OWN argument rather than swallowed as part of the path — this is the
-    documented nested-quoting footgun 40-RESEARCH.md Pattern 3 names explicitly.
+    parsed as its OWN argument rather than swallowed as part of the path — a well-known
+    nested-quoting footgun when a shell's own quoting and Task Scheduler's own quoting
+    of `/TR` are conflated.
     """
     return f'"{exe_path}" {MINIMIZED_FLAG}'
 
