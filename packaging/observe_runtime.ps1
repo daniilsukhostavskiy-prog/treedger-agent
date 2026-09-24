@@ -398,8 +398,45 @@ $outsideOwnFolderPaths = $allChangedPaths | Where-Object { -not $_.StartsWith($a
 # the control window -- when no agent was running -- cannot be evidence about
 # the agent. See the ambient-control block above for why this is necessary and
 # why it is still not true per-process attribution.
-$filesystemViolations = $outsideOwnFolderPaths | Where-Object { -not $ambientPathSet.Contains($_) }
+$afterAmbientPaths = $outsideOwnFolderPaths | Where-Object { -not $ambientPathSet.Contains($_) }
 $ambientSuppressedPaths = $outsideOwnFolderPaths | Where-Object { $ambientPathSet.Contains($_) }
+
+# --- OS registry-hive artifacts -------------------------------------------
+#
+# Fact 3 asks one question: does the PROGRAM write files outside its own
+# folder? A registry hive and its transaction logs are not files any program
+# writes. They are operating-system state that the kernel updates whenever any
+# process touches HKCU -- and tkinter and COM both touch HKCU\Software\Classes
+# while a window initialises. The agent never opens, creates or names these
+# files and has no idea they exist. Charging them to it does not answer Fact
+# 3's question; it answers "did a process run on Windows".
+#
+# Probe run #5 (treedger-agent@369d36a) reduced Fact 3 to exactly one such
+# path: ...\AppData\Local\Microsoft\Windows\UsrClass.dat.LOG1.
+#
+# The ambient noise floor cannot catch these, and not for the reason the
+# observer's own log files could not be caught. Those did not exist before
+# launch. These are provoked BY the launch -- the control window measures a
+# machine where nothing is starting a process, so nothing touches the classes
+# hive. No before-measurement can ever subtract a side effect of starting.
+#
+# THE SHAPE OF THIS LIST IS DELIBERATE AND MUST NOT BE RELAXED.
+# It matches the two HKCU hive base names and their sidecars, anchored so that
+# the name is either the hive itself or the hive followed by '.' or '{':
+#     NTUSER.DAT, NTUSER.DAT.LOG1, NTUSER.DAT{guid}.TM.blf,
+#     UsrClass.dat, UsrClass.dat.LOG2, UsrClass.dat{guid}.TMContainer...
+# It is NOT a directory pattern. "everything under AppData\Local\Microsoft"
+# would suppress real findings, and every broadened exclusion is a step toward
+# a check that verifies nothing. Every path suppressed here is PRINTED on every
+# run, with this reason, and kept in the JSON -- classified, never discarded.
+# If this list ever grows, the growth has to be visible and argued for.
+$registryHiveArtifactPattern = '^(NTUSER\.DAT|UsrClass\.dat)($|[.{])'
+$osRegistryArtifactPaths = $afterAmbientPaths | Where-Object {
+    [System.IO.Path]::GetFileName($_) -match $registryHiveArtifactPattern
+}
+$filesystemViolations = $afterAmbientPaths | Where-Object {
+    -not ([System.IO.Path]::GetFileName($_) -match $registryHiveArtifactPattern)
+}
 
 # ---------------------------------------------------------------------------
 # Fact 2 -- resolve the base-url host and classify every observed remote address
@@ -482,6 +519,8 @@ $result = [ordered]@{
             outsideOwnFolderPaths    = @($outsideOwnFolderPaths)
             ambientNoiseFloorPaths   = @($ambientPathSet)
             ambientSuppressedPaths   = @($ambientSuppressedPaths)
+            osRegistryArtifactPaths  = @($osRegistryArtifactPaths)
+            osRegistryArtifactNote   = "Registry hive files and their transaction logs (NTUSER.DAT*, UsrClass.dat*). The kernel updates these when any process touches HKCU; tkinter and COM do so while a window initialises. They are OS state, not files the program writes, so they do not count toward Fact 3 -- but they are recorded here in full and printed on every run, never silently dropped."
             attributionNote          = "This script diffs directory trees; it cannot attribute a write to a process. Paths that also changed during an equal-length control window with no agent running are subtracted as machine noise. Read violatingPaths before believing Fact 3 either way."
         }
     }
@@ -503,6 +542,10 @@ Write-Host "Fact 1 (no listening port):         $noListeningPortHeld"
 Write-Host "Fact 2 (outbound only to base_url):  $outboundOnlyToBaseUrlHeld"
 Write-Host "Fact 3 (writes only in own folder):  $writesOnlyInOwnFolderHeld"
 Write-Host "    ambient noise floor: $($ambientPathSet.Count) path(s); suppressed as noise: $(@($ambientSuppressedPaths).Count)"
+if (@($osRegistryArtifactPaths).Count -gt 0) {
+    Write-Host "    not counted (OS registry hive/transaction state, not a program write) -- $(@($osRegistryArtifactPaths).Count) path(s):"
+    foreach ($registryArtifact in $osRegistryArtifactPaths) { Write-Host "      $registryArtifact" }
+}
 if (@($filesystemViolations).Count -gt 0) {
     Write-Host "    Fact 3 charged these path(s) to the agent -- inspect before treating as a finding:"
     foreach ($violation in $filesystemViolations) { Write-Host "      $violation" }
