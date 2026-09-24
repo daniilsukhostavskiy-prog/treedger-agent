@@ -2,7 +2,8 @@
 Unit tests for agent/mt5_bridge.py.
 
 None of these tests touch a real MetaTrader5 terminal or the real MetaTrader5 pip
-package — this machine has neither. Tests that need to exercise "MT5 available and
+package. Whether this machine has them is irrelevant to every test below:
+availability is always injected, never read. Tests that need "MT5 available and
 returned X" behaviour monkeypatch the module's own `MT5_AVAILABLE` flag and its
 module-level `mt5` reference directly with a fake stand-in object (the same
 monkeypatch.setattr(module, attr, fake) technique agent/tests/test_terminal_discovery.py
@@ -15,6 +16,7 @@ reference (or lack thereof) at import time, before any per-test fixture can run.
 """
 from __future__ import annotations
 
+import pathlib
 import types
 from datetime import datetime, timezone
 
@@ -61,14 +63,44 @@ class _FakeDeal:
 
 
 # ---------------------------------------------------------------------------
-# Module import without MetaTrader5 present (the actual state of this machine)
+# Degradation when MetaTrader5 is absent — INJECTED, never read off the machine
 # ---------------------------------------------------------------------------
+#
+# These tests used to assert `mt5_bridge.MT5_AVAILABLE is False` directly. That is
+# a property of the machine the tests happened to run on, not a property of the
+# program: on a Linux sandbox there is no win_amd64 wheel, so the import fails and
+# the flag is False — but on windows-latest MetaTrader5 installs from
+# requirements.txt exactly as intended, the flag is True, and `last_error_tuple()`
+# returns a real MT5 code such as (-10004, 'No IPC connection') because the
+# package IS present and only the terminal is not. Release run #2 failed on all
+# three of them, and the old test name ("..._on_this_machine") admitted the defect
+# outright.
+#
+# The degradation path is worth testing and is kept. It is now INJECTED via the
+# fixture below — the same monkeypatch technique this file already uses to
+# simulate MT5 being available — so it exercises the same branch on both platforms
+# and asserts the program's behaviour instead of the environment's.
+#
+# Do not "fix" a future failure here by expecting True on Windows, and do not skip
+# these when MetaTrader5 is importable: that would stop testing degradation
+# precisely on the machines where the program actually runs.
 
-def test_module_imports_and_reports_mt5_unavailable_on_this_machine():
-    assert mt5_bridge.MT5_AVAILABLE is False
+@pytest.fixture
+def mt5_unavailable(monkeypatch):
+    """Force the no-MetaTrader5 branch regardless of what this machine has."""
+    monkeypatch.setattr(mt5_bridge, "MT5_AVAILABLE", False)
+    monkeypatch.setattr(mt5_bridge, "mt5", None)
 
 
-def test_every_call_degrades_gracefully_when_mt5_unavailable():
+def test_module_is_importable_whether_or_not_metatrader5_is_present():
+    # The load-bearing proof is that importing this module at the top of this file
+    # did not raise on a machine that may have no MetaTrader5 wheel at all. What
+    # the flag's VALUE is depends on the machine and is deliberately not asserted.
+    assert isinstance(mt5_bridge.MT5_AVAILABLE, bool)
+    assert mt5_bridge.MT5_AVAILABLE or mt5_bridge.mt5 is None
+
+
+def test_every_call_degrades_gracefully_when_mt5_unavailable(mt5_unavailable):
     assert mt5_bridge.get_account_info() is None
     assert mt5_bridge.current_logged_in_account() is None
     assert mt5_bridge.last_error_tuple() is None
@@ -127,8 +159,9 @@ def test_initialize_terminal_raises_when_no_path_found_anywhere(monkeypatch):
         mt5_bridge.initialize_terminal()
 
 
-def test_initialize_terminal_returns_false_when_mt5_unavailable_even_with_a_path():
-    assert mt5_bridge.MT5_AVAILABLE is False
+def test_initialize_terminal_returns_false_when_mt5_unavailable_even_with_a_path(
+    mt5_unavailable,
+):
     assert mt5_bridge.initialize_terminal(path=r"C:\fake\terminal64.exe") is False
 
 
@@ -463,3 +496,54 @@ def test_detect_utc_offset_zero_offset_is_still_detected_true(monkeypatch):
     result = mt5_bridge.detect_broker_utc_offset_seconds()
     assert result.offset_seconds == 0
     assert result.detected is True
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: no test may read MT5 availability off the machine
+# ---------------------------------------------------------------------------
+
+def test_no_test_asserts_ambient_mt5_availability():
+    """
+    Enforce, rather than merely advise, the rule the comment above states.
+
+    Release run #2 failed because three tests asserted `mt5_bridge.MT5_AVAILABLE
+    is False` — true on a Linux sandbox with no win_amd64 wheel, false on
+    windows-latest where MetaTrader5 installs normally. That pinned a property of
+    the machine instead of a property of the program, and it cost a release run
+    to discover because the suite had never run on Windows.
+
+    This is `ast`-based on purpose. A text search for the flag name would match
+    this docstring, the explanatory comment above, and the fixture that legitimately
+    monkeypatches the flag — the same defect that made the old text-search
+    `test_no_process_kill_call` trip over prose describing what it forbade. Only a
+    real comparison node counts: `MT5_AVAILABLE is <constant>` inside an `assert`.
+    Reading the flag is fine; asserting its ambient value is not.
+    """
+    import ast
+
+    source = pathlib.Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    offenders: list[str] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        for sub in ast.walk(node.test):
+            if not isinstance(sub, ast.Compare):
+                continue
+            reads_flag = any(
+                isinstance(n, ast.Attribute) and n.attr == "MT5_AVAILABLE"
+                for n in ast.walk(sub)
+            )
+            compares_to_constant = any(
+                isinstance(c, ast.Constant) for c in sub.comparators
+            )
+            if reads_flag and compares_to_constant:
+                offenders.append(f"line {sub.lineno}")
+
+    assert not offenders, (
+        "a test asserts the machine's ambient MetaTrader5 availability at "
+        + ", ".join(offenders)
+        + " — inject it with the mt5_unavailable fixture instead. This exact "
+        "pattern failed release run #2 on windows-latest."
+    )
