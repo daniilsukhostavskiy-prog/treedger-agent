@@ -1,0 +1,25 @@
+# Treedger local MT5 sync agent — test-only dependencies.
+#
+# Kept SEPARATE from requirements.txt on purpose. requirements.txt is the list of
+# packages the shipped program actually needs at runtime; nothing in this file is
+# needed to run the program, and nothing here may ever become a runtime import.
+#
+# Install both to work on the agent or to run its suite:
+#     pip install -r agent/requirements.txt -r agent/requirements-dev.txt
+#
+# pytest is pinned to the version this suite is verified against (219 passed,
+# 2 skipped — the 2 skips are test_dpapi.py's off-Windows branch, correctly
+# inapplicable on Windows). Read from a proven run, not guessed or bumped.
+#
+# No pytest plugins are required. `--strict-markers` and `--junitxml`, both used by
+# the release workflow's blocking gates, ship in pytest core (`_pytest.junitxml`) —
+# do not add a plugin for either.
+#
+# NOTE for anyone touching the Nuitka build: `agent/tests/` has an `__init__.py`, so
+# `agent.tests` is a real subpackage of `agent`, and `--include-package=agent`
+# recurses into it. Installing pytest therefore makes it FOLLOWABLE from the build
+# graph, which would compile pytest and its whole dependency tree into the released
+# binary. Both workflows pass `--nofollow-import-to=agent.tests` to prevent that.
+# Removing that flag while this file is installed would silently ship the test suite
+# inside the executable.
+pytest==9.1.1

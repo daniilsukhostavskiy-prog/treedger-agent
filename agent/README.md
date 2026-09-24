@@ -68,6 +68,15 @@ pip install -r agent/requirements.txt
 python -m agent.main
 ```
 
+To run the test suite as well, install the test-only dependencies too — `pytest` is
+deliberately not in `requirements.txt`, which lists what the shipped program needs at
+runtime:
+
+```
+pip install -r agent/requirements.txt -r agent/requirements-dev.txt
+python -m pytest agent/tests -q
+```
+
 `agent/` is a real Python package — launching `main.py` directly by its file path (rather
 than as a module) fails with `ModuleNotFoundError: No module named 'agent'`, because
 Python does not add the project root to its module search path when a file is launched

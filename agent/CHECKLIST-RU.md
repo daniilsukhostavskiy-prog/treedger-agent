@@ -39,8 +39,12 @@
 ```powershell
 cd C:\tradeproof
 git pull
-pip install -r agent/requirements.txt
+pip install -r agent/requirements.txt -r agent/requirements-dev.txt
 ```
+
+Оба файла, а не только первый: `pytest` лежит в `requirements-dev.txt` и намеренно
+отсутствует в `requirements.txt` — там перечислено только то, что нужно самой программе
+во время работы. Без второго файла `pytest` ниже не запустится.
 
 Больше ничего не нужно: ни ключей, ни переменных окружения, ни настроек. Программа
 обращается к боевому `https://treedger.com`, пароли расшифровываются на сервере.

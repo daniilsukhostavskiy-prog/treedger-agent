@@ -25,7 +25,7 @@ env:
   # failure on real build output, never pre-guessed. --standalone is locked
   # project-wide; the single-executable bundling mode is never used anywhere
   # in this workflow.
-  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy"
+  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy --nofollow-import-to=agent.tests"
   # A deliberately invalid bearer token, planted into config.json before the
   # runtime-observation launch below. The program must reach its own
   # authorization-failure path and stop there — this value is never a real
@@ -83,7 +83,10 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r agent/requirements.txt nuitka
+          # requirements-dev.txt carries pytest, which four blocking gates below need.
+          # It is NOT in requirements.txt: that file is the shipped program's runtime
+          # dependency list and pytest is never a runtime import.
+          pip install -r agent/requirements.txt -r agent/requirements-dev.txt nuitka
 
       - name: Log resolved Nuitka + numpy versions
         shell: pwsh
@@ -92,12 +95,23 @@ jobs:
           python -c "import numpy; print('numpy', numpy.__version__)"
 
       - name: Full test suite
+        # pytest comes from agent/requirements-dev.txt, installed above. It is
+        # NOT in requirements.txt, which is the shipped program's runtime
+        # dependency list. Release run #1 failed on this exact step with
+        # "No module named pytest" because nothing installed it — and six green
+        # probe runs could not have caught that, since probe-window.yml shares
+        # the install step but runs no tests at all.
+        #
         # --strict-markers requires the "dpapi" marker to be registered in
-        # pytest.ini — a sibling plan in this phase adds that registration.
-        # Without it, this step fails for an unrelated reason (an
-        # unregistered marker name), not because of anything about DPAPI
-        # itself; recorded here so a future reader debugging a red build on
-        # this step checks pytest.ini first.
+        # agent/pytest.ini; that registration is in place. Without it this step
+        # fails for an unrelated reason (an unregistered marker name) rather than
+        # anything about DPAPI, so a reader debugging a red build here should
+        # check agent/pytest.ini first.
+        #
+        # --strict-markers and --junitxml both ship in pytest core
+        # (_pytest.junitxml). No plugin is needed for either, and none should be
+        # added — the DPAPI assertion below reads the junit-xml report this
+        # produces.
         shell: pwsh
         run: |
           python -m pytest agent/tests -q --strict-markers --junitxml=report.xml
@@ -118,8 +132,18 @@ jobs:
 
       - name: Nuitka build (--standalone, never the single-executable bundling mode)
         # The import-exclusion flag that tells Nuitka to skip following a
-        # package into the standalone build is deliberately never used here,
-        # even to speed the build up: 40-RESEARCH.md Pitfall 2 documents that
+        # package into the standalone build is used EXACTLY ONCE here, for
+        # `agent.tests`, and for no other package. That single use is the
+        # sanctioned one described at the end of this comment, not a shortcut:
+        # `agent/tests/__init__.py` exists, so `agent.tests` is a real subpackage
+        # of `agent` and `--include-package=agent` recurses into it. Thirteen test
+        # modules import pytest. Once pytest is installed (it has to be — four
+        # blocking gates above need it) those imports become followable and the
+        # whole test suite plus pytest's dependency tree would be compiled into
+        # the released binary. Verified unused at runtime: no module in `agent/`
+        # outside `agent/tests/` imports pytest, `agent.tests`, or `tests`.
+        # It is used for nothing else, even to speed the build up:
+        # 40-RESEARCH.md Pitfall 2 documents that
         # Nuitka's standalone bootstrap (restoreStandaloneEnvironment())
         # rewrites sys.path to point only at the binary's own directory, so a
         # package excluded from the build that way is never found at
