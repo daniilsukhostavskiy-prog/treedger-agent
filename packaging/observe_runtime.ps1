@@ -180,11 +180,22 @@ $localAppDataDir = $env:LOCALAPPDATA
 $tempDir = $env:TEMP
 $userProfileDir = $env:USERPROFILE
 
-# This script's OWN diagnostic-capture artifacts live under a dedicated
-# subfolder of TEMP and are excluded from the fact-3 diff below -- they are
-# writes made by THIS OBSERVER, not by the observed process, and conflating
-# them would falsely blame the agent for output this script itself created.
-$diagDir = Join-Path $tempDir "treedger-observe-runtime"
+# The observer's own scratch directory MUST live outside every watched root.
+#
+# It used to be created under %TEMP%. On a GitHub-hosted runner %TEMP% is
+# C:\Users\runneradmin\AppData\Local\Temp -- that is, NESTED INSIDE %LOCALAPPDATA%,
+# which this script also snapshots recursively. The old exclusion filtered these
+# files out of the TEMP diff only, so the LOCALAPPDATA walk picked them straight
+# back up, and Fact 3 charged the agent with the observer's own stdout/stderr
+# capture files (probe run #4, treedger-agent@549917c). The measurement was
+# reporting its own side effect as the subject's misbehaviour. The ambient noise
+# floor could never catch this: that window runs BEFORE the launch, and these
+# files only come into existence WITH the launch.
+#
+# Writing outside the watched roots removes the whole class of error rather than
+# filtering one instance of it. On the runner the working directory is the
+# checkout, which is not under the user profile at all.
+$diagDir = Join-Path (Get-Location).Path "treedger-observe-runtime"
 New-Item -ItemType Directory -Path $diagDir -Force | Out-Null
 $stdoutLogPath = Join-Path $diagDir "agent-stdout.log"
 $stderrLogPath = Join-Path $diagDir "agent-stderr.log"
@@ -317,7 +328,17 @@ while ((Get-Date) -lt $deadline) {
 # Give the process the rest of its budgeted duration to exit on its own; if
 # it is still running, terminate it so the observation window has a definite
 # end and the AFTER filesystem snapshot is taken against a quiesced process.
+# Distinguish "the process ended on its own" from "the observer ended it at the
+# end of the budgeted window". The program under observation is a GUI program and
+# by definition does not exit by itself -- probe run #3 recorded exactly that
+# (D27_PROCESS_TERMINATED=no). So the forced stop below is the NORMAL end of a
+# healthy measurement, and the -1 exit code it produces is the observer's own
+# doing, not a crash. Reporting it as abnormal would light the warning on every
+# single run including perfectly healthy ones, and a signal that is always on
+# stops being read -- the same disease Fact 3 had before the noise floor existed.
+$terminatedByObserver = $false
 if (-not $proc.HasExited) {
+    $terminatedByObserver = $true
     try {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     } catch {
@@ -326,6 +347,11 @@ if (-not $proc.HasExited) {
 }
 $proc.WaitForExit(5000) | Out-Null
 $exitCode = if ($proc.HasExited) { $proc.ExitCode } else { $null }
+
+# An exit code is only evidence of a fault when the process chose to exit. When
+# the observer killed it, the code describes the kill, not the program.
+$exitedOnItsOwn = -not $terminatedByObserver
+$diedUnexpectedly = $exitedOnItsOwn -and $proc.HasExited -and $null -ne $exitCode -and $exitCode -ne 0
 
 # ---------------------------------------------------------------------------
 # AFTER snapshot + diff
@@ -344,7 +370,24 @@ $changedUserProfile = Get-ChangedPaths -Before $beforeUserProfile -After $afterU
 # This observer's own diagnostic-capture files are excluded here -- they are
 # writes made by THIS SCRIPT, not by the observed process (see $diagDir note
 # above).
-$changedTemp = $changedTemp | Where-Object { $_ -ne $stdoutLogPath -and $_ -ne $stderrLogPath -and -not $_.StartsWith($diagDir) }
+# Defence in depth. $diagDir now sits outside every watched root, so this should
+# match nothing -- but if a future edit moves it back inside one, or -OutputPath is
+# pointed somewhere watched, the exclusion has to hold for ALL FOUR roots, not for
+# the TEMP diff alone. That single-root exclusion is exactly how the observer's own
+# log files reached Fact 3 in probe run #4. Ordinal-ignore-case, because Windows
+# paths are case-insensitive and a culture-sensitive StartsWith was a second way
+# for the old check to miss.
+$diagDirPrefix = $diagDir.TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+$resolvedOutputPath = try { (Resolve-Path -LiteralPath $OutputPath -ErrorAction Stop).Path } catch { $OutputPath }
+function Test-IsObserverOwnFile {
+    param([string]$Path)
+    if ($Path -eq $stdoutLogPath -or $Path -eq $stderrLogPath -or $Path -eq $resolvedOutputPath) { return $true }
+    return $Path.StartsWith($diagDirPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+$changedAppData      = $changedAppData      | Where-Object { -not (Test-IsObserverOwnFile -Path $_) }
+$changedLocalAppData = $changedLocalAppData | Where-Object { -not (Test-IsObserverOwnFile -Path $_) }
+$changedTemp         = $changedTemp         | Where-Object { -not (Test-IsObserverOwnFile -Path $_) }
+$changedUserProfile  = $changedUserProfile  | Where-Object { -not (Test-IsObserverOwnFile -Path $_) }
 
 $allChangedPaths = @($changedAppData) + @($changedLocalAppData) + @($changedTemp) + @($changedUserProfile)
 $appDataAgentPrefix = $appDataDir + [System.IO.Path]::DirectorySeparatorChar
@@ -417,9 +460,13 @@ $result = [ordered]@{
     writesOnlyInOwnFolderHeld  = $writesOnlyInOwnFolderHeld
     allFactsHeld               = $allFactsHeld
     process                    = [ordered]@{
-        pid       = $proc.Id
-        exitCode  = $exitCode
-        hasExited = $proc.HasExited
+        pid                   = $proc.Id
+        exitCode              = $exitCode
+        hasExited             = $proc.HasExited
+        terminatedByObserver  = $terminatedByObserver
+        exitedOnItsOwn        = $exitedOnItsOwn
+        diedUnexpectedly      = $diedUnexpectedly
+        exitCodeNote          = "When terminatedByObserver is true the exit code describes the observer's forced stop at the end of the budgeted window, not a fault in the program. A GUI program does not exit by itself; probe run #3 recorded D27_PROCESS_TERMINATED=no."
     }
     evidence = [ordered]@{
         listeningPorts       = $listeningEvidence
@@ -460,13 +507,15 @@ if (@($filesystemViolations).Count -gt 0) {
     Write-Host "    Fact 3 charged these path(s) to the agent -- inspect before treating as a finding:"
     foreach ($violation in $filesystemViolations) { Write-Host "      $violation" }
 }
-if ($proc.HasExited -and $null -ne $exitCode -and $exitCode -ne 0) {
-    Write-Host "    WARNING: the observed process exited with $exitCode. All three facts above are"
-    Write-Host "    measurements of a process that was not running normally, and none of them is"
-    Write-Host "    evidence about the shipped program until it is re-measured on a healthy build."
+if ($diedUnexpectedly) {
+    Write-Host "    WARNING: the observed process exited BY ITSELF with $exitCode before the"
+    Write-Host "    observation window ended. All three facts above are measurements of a process"
+    Write-Host "    that was not running normally, and none of them is evidence about the shipped"
+    Write-Host "    program until it is re-measured on a healthy build."
 }
 Write-Host "ALL FACTS HELD:                      $allFactsHeld"
-Write-Host "Process exit code: $exitCode (HasExited=$($proc.HasExited))"
+$endedHow = if ($terminatedByObserver) { "terminated by the observer at the end of the window (expected for a GUI program)" } else { "exited on its own" }
+Write-Host "Process exit code: $exitCode (HasExited=$($proc.HasExited)) -- $endedHow"
 Write-Host "--- DIAGNOSTIC (not used for any fact above) ---"
 Write-Host "stdout: $diagnosticStdout"
 Write-Host "stderr: $diagnosticStderr"
