@@ -1,0 +1,22 @@
+# Treedger local MT5 sync agent — pinned dependencies.
+#
+# This file is deliberately independent of mt5-service/requirements.txt (no shared
+# constraints file) so agent/ can move whole into another repository without edits.
+#
+# MetaTrader5 and certifi are pinned to the EXACT versions already proven working in
+# mt5-service/requirements.txt — read from that file, not guessed or bumped here.
+#
+# tkinter needs NO entry here: it ships with the standard python.org Windows installer
+# (this program's own required Python source, see README.md). A Python installed without
+# it (e.g. some minimal/embeddable distributions) must fail with a clear, actionable
+# message at startup — never a bare `ModuleNotFoundError: No module named 'tkinter'`
+# traceback with no explanation.
+MetaTrader5==5.0.5735
+certifi==2026.5.20
+
+# HTTP client for the agent -> src/app/api/agent/* endpoints. Pinned to the current
+# stable release resolved live via `pip index versions requests` at the time this file
+# was written (2026-09-08). If that command cannot reach the network when this file is
+# next regenerated, pin the newest version already present in the local environment
+# instead of inventing one — see 39-03-SUMMARY.md for this run's resolution.
+requests==2.34.2

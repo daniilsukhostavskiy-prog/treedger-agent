@@ -1,0 +1,220 @@
+# D-27 one-shot probe — window render + runtime observation.
+#
+# 40-CONTEXT.md D-27: before any second command-line entry point for the agent's
+# window is ever written, this workflow measures — empirically, once — whether a
+# tkinter window actually renders when the built .exe is launched the way an
+# ordinary person launches it: NO command-line flags, on a windows-latest
+# GitHub-hosted runner. If the window opens, no second launch mode is ever built;
+# CI keeps measuring exactly the path real users take. If it does not open, that
+# second entry point gets added later, as an explicit, separately-recorded
+# amendment — never guessed at up front.
+#
+# This workflow is dispatched by hand (workflow_dispatch only) and is deliberately
+# NOT wired to any push/tag trigger — it exists to answer one empirical question
+# once, not to gate every release. build-release.yml (the actual release pipeline)
+# is the separate, always-on gate.
+#
+# This workflow does not know about, does not reference, and does not pass any
+# not-yet-decided command-line flag to the built .exe — it launches it exactly the
+# way a person would, with nothing on the command line at all. If the window-render
+# question above resolves to "no", a follow-up amendment to this project's own
+# decision record is the place a new flag gets introduced, not this file.
+#
+# A "no" result for window rendering is a FINDING to be recorded, not a build
+# failure — this job must never fail merely because no window appeared. See the
+# "Print D-27 summary" step below; nothing in this workflow inspects
+# windowRendered/window_rendered to decide the job's own pass/fail status.
+
+on:
+  workflow_dispatch: {}
+
+env:
+  # Kept intentionally minimal (40-RESEARCH.md Open Question 3 — no known prior
+  # art for MetaTrader5 + numpy + tkinter under Nuitka standalone). Flags are
+  # added only in response to an OBSERVED failure on real build output from the
+  # human checkpoint (40-CONTEXT.md D-18), never pre-guessed from documentation.
+  # --standalone is locked project-wide; the single-executable bundling mode is
+  # never used, in this workflow or anywhere else in this phase.
+  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads"
+  # A deliberately invalid bearer token, planted into config.json before every
+  # launch below. The program must reach its own authorization-failure path and
+  # stop there — this value is never a real token and is never sent anywhere
+  # with intent to succeed.
+  TREEDGER_AGENT_INVALID_TOKEN: "d27-probe-deliberately-invalid-token"
+  TREEDGER_AGENT_BASE_URL: "https://treedger.com"
+  TREEDGER_AGENT_BASE_URL_HOST: "treedger.com"
+
+jobs:
+  probe:
+    name: D-27 probe (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies + Nuitka
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt nuitka
+
+      - name: Log resolved Nuitka version (40-RESEARCH.md A1 — never trust a pinned version blind)
+        shell: pwsh
+        run: |
+          python -m pip index versions nuitka
+
+      - name: Build with Nuitka --standalone
+        shell: pwsh
+        run: |
+          python -m nuitka $env:NUITKA_FLAGS.Split(" ") --output-dir=build_output main.py 2>&1 | Tee-Object -FilePath nuitka-build.log
+
+      - name: Plant a deliberately invalid token into config.json
+        shell: pwsh
+        run: |
+          $appDir = Join-Path $env:APPDATA "TreedgerAgent"
+          New-Item -ItemType Directory -Path $appDir -Force | Out-Null
+          # Exactly the two keys config_store.py's own docstring allows —
+          # "token" and "base_url", nothing else — matching its format at
+          # probe time.
+          $config = [ordered]@{
+            token    = $env:TREEDGER_AGENT_INVALID_TOKEN
+            base_url = $env:TREEDGER_AGENT_BASE_URL
+          } | ConvertTo-Json
+          Set-Content -Path (Join-Path $appDir "config.json") -Value $config -Encoding utf8
+
+      - name: Launch with NO flags and observe for a top-level window
+        id: window_probe
+        shell: pwsh
+        run: |
+          $exePath = "build_output/main.dist/main.exe"
+
+          # A REAL external observation, not the program's own claim: EnumWindows
+          # + GetWindowThreadProcessId + IsWindowVisible via a raw P/Invoke
+          # declaration, filtered to the PID this step itself launched.
+          Add-Type -Namespace Native -Name WindowProbe -MemberDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+
+          public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+          [DllImport("user32.dll")]
+          public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+          [DllImport("user32.dll")]
+          public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+          [DllImport("user32.dll")]
+          public static extern bool IsWindowVisible(IntPtr hWnd);
+          '@
+
+          function Test-WindowRenderedForPid {
+              param([int]$TargetPid)
+              $script:found = $false
+              $callback = {
+                  param($hWnd, $lParam)
+                  $procId = 0
+                  [void][Native.WindowProbe]::GetWindowThreadProcessId($hWnd, [ref]$procId)
+                  if ($procId -eq $TargetPid -and [Native.WindowProbe]::IsWindowVisible($hWnd)) {
+                      $script:found = $true
+                  }
+                  return $true
+              }
+              [void][Native.WindowProbe]::EnumWindows($callback, [IntPtr]::Zero)
+              return $script:found
+          }
+
+          # NOTE: at least one open Nuitka issue (#3019, 40-RESEARCH.md Pitfall 1)
+          # reports a tkinter program that builds fine and shows no window at all
+          # when a console-suppression flag is combined with --standalone on some
+          # Nuitka versions. That flag is deliberately NOT used anywhere in this
+          # build — testing it here would confound the one question this probe
+          # exists to answer.
+          $proc = Start-Process -FilePath $exePath -PassThru
+
+          $windowRendered = $false
+          $deadline = (Get-Date).AddSeconds(15)
+          while ((Get-Date) -lt $deadline) {
+              if (Test-WindowRenderedForPid -TargetPid $proc.Id) {
+                  $windowRendered = $true
+                  break
+              }
+              if ($proc.HasExited) { break }
+              Start-Sleep -Seconds 1
+          }
+
+          # Give the process a further bounded window to reach and act on its own
+          # authorization-failure path (the invalid token planted above) before
+          # this step forcibly ends it.
+          $extraDeadline = (Get-Date).AddSeconds(15)
+          while ((Get-Date) -lt $extraDeadline -and -not $proc.HasExited) {
+              Start-Sleep -Seconds 1
+          }
+
+          $processTerminated = $proc.HasExited
+          $exitCode = $null
+          if ($proc.HasExited) {
+              $exitCode = $proc.ExitCode
+          } else {
+              Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+              $proc.WaitForExit(5000) | Out-Null
+          }
+
+          $result = [ordered]@{
+              windowRendered    = $windowRendered
+              processTerminated = $processTerminated
+              exitCode          = $exitCode
+          }
+          $result | ConvertTo-Json | Out-File -FilePath window-probe-result.json -Encoding utf8
+
+          $windowRenderedStr = if ($windowRendered) { "yes" } else { "no" }
+          $processTerminatedStr = if ($processTerminated) { "yes" } else { "no" }
+          $exitCodeStr = if ($null -ne $exitCode) { $exitCode } else { "null" }
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "window_rendered=$windowRenderedStr"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "process_terminated=$processTerminatedStr"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "exit_code=$exitCodeStr"
+
+      - name: Run the D-17 external runtime observer against the same configured launch
+        # This is a SEPARATE process launch from the window-probe step above, not
+        # a shared OS process handle — each `run:` block in this workflow is its
+        # own PowerShell process, and GitHub Actions has no built-in mechanism to
+        # hand a live Process object between steps. "The same launch" is
+        # satisfied at the level 40-CONTEXT.md D-17 actually cares about: the
+        # same built .exe, the same planted invalid token, the same base_url —
+        # not literally the same PID. A future plan that needs literal
+        # single-process sharing between the window check and the three-fact
+        # observer would be a real, separate redesign, not an oversight here.
+        #
+        # This step does not gate the job (continue-on-error: true) — this
+        # workflow is a one-shot measurement, not the release gate. The blocking
+        # D-17 gate lives in build-release.yml.
+        id: runtime_observation
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          & ./packaging/observe_runtime.ps1 -ExePath "build_output/main.dist/main.exe" -BaseUrlHost $env:TREEDGER_AGENT_BASE_URL_HOST -DurationSeconds 30
+
+      - name: Print D-27 summary
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "D27_WINDOW_RENDERED=${{ steps.window_probe.outputs.window_rendered }}"
+          Write-Host "D27_PROCESS_TERMINATED=${{ steps.window_probe.outputs.process_terminated }}"
+          Write-Host "D27_EXIT_CODE=${{ steps.window_probe.outputs.exit_code }}"
+          Write-Host "runtime_observation step outcome: ${{ steps.runtime_observation.outcome }} (informational — see runtime-observation.json; this step never fails the job)"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: d27-probe-results
+          path: |
+            runtime-observation.json
+            window-probe-result.json
+            nuitka-build.log
+          if-no-files-found: warn

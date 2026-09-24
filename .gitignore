@@ -1,0 +1,27 @@
+# This file becomes the PUBLIC treedger-agent repository's ROOT .gitignore at move time
+# (40-CONTEXT.md D-04). The Nuitka build-output directories below are excluded because they
+# carry no source-review value — a multi-gigabyte compiled tree adds nothing a reader of this
+# public, audit-first repository could ever want to inspect (D-01), and committing it would
+# make every clone enormous for no benefit.
+
+# Python bytecode / caches
+# No trailing slash on __pycache__ (see note below on the Nuitka patterns): a
+# directory-only pattern only matches when git can already see the path is a directory
+# on disk, so the un-slashed form also matches a not-yet-created __pycache__ path.
+__pycache__
+*.py[cod]
+.pytest_cache/
+
+# Nuitka --standalone build output (never --onefile, see agent/packaging/github-workflows/)
+# No trailing slash: these directories do not exist yet on a fresh checkout, and a
+# directory-only pattern (trailing "/") only matches a path git can already see is a
+# directory on disk — so the un-slashed form is used deliberately, to also match before
+# the directory has ever been created.
+*.build
+*.dist
+*.onefile-build
+*.exe
+
+# CI-produced test/verification reports (regenerated on every run, not source)
+report.xml
+dpapi-report.xml

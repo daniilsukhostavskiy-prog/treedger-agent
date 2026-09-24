@@ -1,0 +1,177 @@
+# Release pipeline — full test suite, real-DPAPI execution assertion, source ast
+# audit, Nuitka standalone build, blocking runtime observation, package + hash,
+# publish.
+#
+# Every one of the steps below that can fail the release (full test suite, the
+# real-DPAPI execution assertion, the source ast structural audit, the blocking
+# runtime observation) has NO continue-on-error and NO `if: always()` on itself
+# or on any step after it — GitHub Actions' own default behaviour (a failed step
+# skips every later step in the same job) is what enforces "nothing publishes if
+# any of those four gates failed." No extra `if:` guard is layered on top of that
+# default, on purpose: an extra guard duplicating what the platform already
+# guarantees is one more place the logic could quietly drift out of sync with the
+# platform's own behaviour.
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+
+env:
+  # Same locked minimal flag set the D-27 probe workflow established a window
+  # renders under (see probe-window.yml's own history/artifacts for that
+  # empirical result). Flags are expanded only in response to an OBSERVED
+  # failure on real build output, never pre-guessed. --standalone is locked
+  # project-wide; the single-executable bundling mode is never used anywhere
+  # in this workflow.
+  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads"
+  # A deliberately invalid bearer token, planted into config.json before the
+  # runtime-observation launch below. The program must reach its own
+  # authorization-failure path and stop there — this value is never a real
+  # token and is never sent anywhere with intent to succeed.
+  TREEDGER_AGENT_INVALID_TOKEN: "release-gate-deliberately-invalid-token"
+  TREEDGER_AGENT_BASE_URL: "https://treedger.com"
+  TREEDGER_AGENT_BASE_URL_HOST: "treedger.com"
+
+permissions:
+  contents: write  # `gh release create` needs this on the default GITHUB_TOKEN
+
+jobs:
+  release:
+    name: Build, verify, and publish (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (full depth — the published commit SHA must be unambiguous)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies + Nuitka
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt nuitka
+
+      - name: Log resolved Nuitka + numpy versions
+        shell: pwsh
+        run: |
+          python -m pip index versions nuitka
+          python -c "import numpy; print('numpy', numpy.__version__)"
+
+      - name: Full test suite
+        # --strict-markers requires the "dpapi" marker to be registered in
+        # pytest.ini — a sibling plan in this phase adds that registration.
+        # Without it, this step fails for an unrelated reason (an
+        # unregistered marker name), not because of anything about DPAPI
+        # itself; recorded here so a future reader debugging a red build on
+        # this step checks pytest.ini first.
+        shell: pwsh
+        run: |
+          python -m pytest tests -q --strict-markers --junitxml=report.xml
+
+      - name: Real-DPAPI execution assertion (D-20 — never trust pytest's own exit code for a SKIP)
+        shell: pwsh
+        run: |
+          python -m pytest tests -q --strict-markers -m dpapi --junitxml=dpapi-report.xml
+          python packaging/assert_dpapi_executed.py dpapi-report.xml
+
+      - name: Source ast structural audit (the audited commit SHA published beside the build hash)
+        id: structural_audit
+        shell: pwsh
+        run: |
+          python -m pytest tests/test_sync.py -q -k StructuralAudit
+          $sha = git rev-parse HEAD
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "commit_sha=$sha"
+
+      - name: Nuitka build (--standalone, never the single-executable bundling mode)
+        # The import-exclusion flag that tells Nuitka to skip following a
+        # package into the standalone build is deliberately never used here,
+        # even to speed the build up: 40-RESEARCH.md Pitfall 2 documents that
+        # Nuitka's standalone bootstrap (restoreStandaloneEnvironment())
+        # rewrites sys.path to point only at the binary's own directory, so a
+        # package excluded from the build that way is never found at
+        # runtime. That flag is reserved for packages verified UNUSED at
+        # runtime, never for a build-time-cost shortcut on a package the
+        # program actually needs (MetaTrader5, numpy).
+        shell: pwsh
+        run: |
+          python -m nuitka $env:NUITKA_FLAGS.Split(" ") --output-dir=build_output main.py 2>&1 | Tee-Object -FilePath nuitka-build.log
+
+      - name: Plant a deliberately invalid token into config.json
+        shell: pwsh
+        run: |
+          $appDir = Join-Path $env:APPDATA "TreedgerAgent"
+          New-Item -ItemType Directory -Path $appDir -Force | Out-Null
+          # Exactly the two keys config_store.py's own docstring allows —
+          # "token" and "base_url", nothing else.
+          $config = [ordered]@{
+            token    = $env:TREEDGER_AGENT_INVALID_TOKEN
+            base_url = $env:TREEDGER_AGENT_BASE_URL
+          } | ConvertTo-Json
+          Set-Content -Path (Join-Path $appDir "config.json") -Value $config -Encoding utf8
+
+      - name: Runtime observation (BLOCKING — D-17/D-18)
+        # CI has no MetaTrader 5 installed, so the built .exe never reaches
+        # the part of its own code that talks to the terminal over IPC — this
+        # step measures a knowingly TRUNCATED execution path, not the full
+        # one. A human repeats these same three measurements once on a
+        # machine with MT5 installed and a real pairing (D-18's human half of
+        # the split); if that measurement ever disagrees with this one, that
+        # is a finding about THIS GATE, not about the build — the gate gets
+        # fixed, the build does not get blamed.
+        #
+        # A non-zero exit here stops the job before the packaging/publish
+        # steps below ever run (see the file-level comment at the top of
+        # this workflow for why no extra `if:` guard is layered on top of
+        # that default GitHub Actions behaviour).
+        shell: pwsh
+        run: |
+          & ./packaging/observe_runtime.ps1 -ExePath "build_output/main.dist/main.exe" -BaseUrlHost $env:TREEDGER_AGENT_BASE_URL_HOST -DurationSeconds 30
+
+      - name: Package the standalone build + compute its hash
+        # D-16 rejects a binary text audit outright — this step never reads
+        # build_output/main.dist as text for any prohibited-string search; it
+        # only zips the directory and hashes the resulting archive.
+        id: package
+        shell: pwsh
+        run: |
+          $refName = "${{ github.ref_name }}"
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $tag = if ($refName) { $refName } else { "dev-$shortSha" }
+          $archiveName = "treedger-agent-$tag-windows.zip"
+          Compress-Archive -Path "build_output/main.dist/*" -DestinationPath $archiveName -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $archiveName).Hash
+          $hashFileName = "$archiveName.sha256.txt"
+          $commitSha = "${{ steps.structural_audit.outputs.commit_sha }}"
+          @(
+            "SHA-256: $hash",
+            "Archive: $archiveName",
+            "Audited commit: $commitSha"
+          ) -join [Environment]::NewLine | Set-Content -Path $hashFileName -Encoding utf8
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "archive_name=$archiveName"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "hash_file_name=$hashFileName"
+
+      - name: Publish release
+        # gh (pre-installed on windows-latest) is used instead of a
+        # third-party release-publishing Action deliberately: in a public
+        # repo whose entire premise is auditability (D-01), every extra
+        # Action is one more thing a reader must trust to believe the
+        # published binary matches the published source.
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.package.outputs.tag }}"
+          gh release create $tag `
+            "${{ steps.package.outputs.archive_name }}" `
+            "${{ steps.package.outputs.hash_file_name }}" `
+            "runtime-observation.json" `
+            --title $tag `
+            --notes "Audited commit: ${{ steps.structural_audit.outputs.commit_sha }}"
