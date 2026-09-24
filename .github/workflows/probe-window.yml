@@ -96,20 +96,31 @@ jobs:
           # A REAL external observation, not the program's own claim: EnumWindows
           # + GetWindowThreadProcessId + IsWindowVisible via a raw P/Invoke
           # declaration, filtered to the PID this step itself launched.
-          Add-Type -Namespace Native -Name WindowProbe -MemberDefinition @'
+          # -TypeDefinition, NOT -MemberDefinition. -MemberDefinition wraps the
+          # supplied code in a class BODY, and a `using` directive is illegal
+          # inside a class body -- that is `error CS1513: } expected`, which
+          # killed probe run #1 before the exe was ever launched. A full type
+          # declaration is the shape that may carry its own using directives.
+          Add-Type -TypeDefinition @'
           using System;
           using System.Runtime.InteropServices;
 
-          public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+          namespace Native
+          {
+              public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
-          [DllImport("user32.dll")]
-          public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+              public static class WindowProbe
+              {
+                  [DllImport("user32.dll")]
+                  public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
 
-          [DllImport("user32.dll")]
-          public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+                  [DllImport("user32.dll")]
+                  public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
-          [DllImport("user32.dll")]
-          public static extern bool IsWindowVisible(IntPtr hWnd);
+                  [DllImport("user32.dll")]
+                  public static extern bool IsWindowVisible(IntPtr hWnd);
+              }
+          }
           '@
 
           function Test-WindowRenderedForPid {
@@ -147,6 +158,20 @@ jobs:
               Start-Sleep -Seconds 1
           }
 
+          # A SECOND, independent reading of the same question, via .NET's own
+          # Process.MainWindowHandle rather than the P/Invoke path above.
+          # Recorded, never authoritative. If the two signals disagree the
+          # harness is suspect and D-27 stays unmeasured -- it must not resolve
+          # to a value neither signal actually supports. Taken here, while the
+          # process is still alive.
+          $mainWindowHandleNonZero = $false
+          try {
+              if (-not $proc.HasExited) {
+                  $proc.Refresh()
+                  $mainWindowHandleNonZero = ($proc.MainWindowHandle -ne [IntPtr]::Zero)
+              }
+          } catch { }
+
           # Give the process a further bounded window to reach and act on its own
           # authorization-failure path (the invalid token planted above) before
           # this step forcibly ends it.
@@ -165,9 +190,10 @@ jobs:
           }
 
           $result = [ordered]@{
-              windowRendered    = $windowRendered
-              processTerminated = $processTerminated
-              exitCode          = $exitCode
+              windowRendered          = $windowRendered
+              processTerminated       = $processTerminated
+              exitCode                = $exitCode
+              mainWindowHandleNonZero = $mainWindowHandleNonZero
           }
           $result | ConvertTo-Json | Out-File -FilePath window-probe-result.json -Encoding utf8
 
@@ -178,6 +204,9 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "window_rendered=$windowRenderedStr"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "process_terminated=$processTerminatedStr"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "exit_code=$exitCodeStr"
+
+          $mwhStr = if ($mainWindowHandleNonZero) { "yes" } else { "no" }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "main_window_handle=$mwhStr"
 
       - name: Run the D-17 external runtime observer against the same configured launch
         # This is a SEPARATE process launch from the window-probe step above, not
@@ -203,9 +232,40 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Write-Host "D27_WINDOW_RENDERED=${{ steps.window_probe.outputs.window_rendered }}"
-          Write-Host "D27_PROCESS_TERMINATED=${{ steps.window_probe.outputs.process_terminated }}"
-          Write-Host "D27_EXIT_CODE=${{ steps.window_probe.outputs.exit_code }}"
+          # An EMPTY value here is NOT a measurement. In probe run #1 the
+          # window_probe step failed before setting any output, so this summary
+          # printed `D27_WINDOW_RENDERED=` -- a blank that reads exactly like a
+          # `no` at a glance. D-27 branches the whole phase; it must never be
+          # settled by a blank. Print `unmeasured` and say so loudly instead.
+          $rendered     = "${{ steps.window_probe.outputs.window_rendered }}"
+          $terminated   = "${{ steps.window_probe.outputs.process_terminated }}"
+          $exit         = "${{ steps.window_probe.outputs.exit_code }}"
+          $mwh          = "${{ steps.window_probe.outputs.main_window_handle }}"
+          $probeOutcome = "${{ steps.window_probe.outcome }}"
+
+          if ([string]::IsNullOrWhiteSpace($rendered))   { $rendered   = "unmeasured" }
+          if ([string]::IsNullOrWhiteSpace($terminated)) { $terminated = "unmeasured" }
+          if ([string]::IsNullOrWhiteSpace($exit))       { $exit       = "unmeasured" }
+          if ([string]::IsNullOrWhiteSpace($mwh))        { $mwh        = "unmeasured" }
+
+          Write-Host "D27_WINDOW_RENDERED=$rendered"
+          Write-Host "D27_PROCESS_TERMINATED=$terminated"
+          Write-Host "D27_EXIT_CODE=$exit"
+          Write-Host "D27_SECONDARY_MAIN_WINDOW_HANDLE=$mwh  (cross-check only, never authoritative)"
+          Write-Host "window_probe step outcome: $probeOutcome"
+
+          if ($rendered -eq "unmeasured") {
+              Write-Host ""
+              Write-Host "D-27 WAS NOT MEASURED. The probe step did not complete, so the exe's"
+              Write-Host "window neither rendered nor failed to render. Do NOT record this as"
+              Write-Host "D27_WINDOW_RENDERED=no -- fix the harness and re-run."
+          } elseif ($rendered -ne $mwh -and $mwh -ne "unmeasured") {
+              Write-Host ""
+              Write-Host "WARNING: the two independent window signals DISAGREE"
+              Write-Host "(EnumWindows=$rendered, MainWindowHandle=$mwh). Treat D-27 as"
+              Write-Host "unmeasured and investigate the harness before branching on it."
+          }
+
           Write-Host "runtime_observation step outcome: ${{ steps.runtime_observation.outcome }} (informational — see runtime-observation.json; this step never fails the job)"
 
       - name: Upload artifacts
