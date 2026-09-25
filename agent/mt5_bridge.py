@@ -132,6 +132,16 @@ TIMEOUT_ERROR_CODES: frozenset[int] = _codes_with_category(ErrorCategory.TIMEOUT
 IPC_UNAVAILABLE_ERROR_CODES: frozenset[int] = _codes_with_category(
     ErrorCategory.CONNECTION_ERROR
 )
+# Codes that, when mt5.initialize() ITSELF fails with them, most often mean
+# «Алготрейдинг» is off (quick 260925-qhs): every row flagged
+# `suggests_algotrading_off_at_connect` (-10005, observed live 2026-09-25) plus every
+# ALGOTRADING_DISABLED row. Derived, never literal — a user-facing HINT only.
+ALGOTRADING_CONNECT_HINT_CODES: frozenset[int] = frozenset(
+    code
+    for code, info in MT5_ERROR_CODES.items()
+    if info.suggests_algotrading_off_at_connect
+    or info.category is ErrorCategory.ALGOTRADING_DISABLED
+)
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +150,13 @@ IPC_UNAVAILABLE_ERROR_CODES: frozenset[int] = _codes_with_category(
 
 # Whole-connect wall-clock budget, both initialize variants together.
 CONNECT_BUDGET_SECONDS: float = 90.0
+# The whole-connect budget used INSTEAD when this very run started the terminal
+# (quick 260925-qhs): a cold terminal start at Windows logon competes with every
+# other startup app, and 90 s was sized for a terminal that was already running.
+# Attempt A keeps its short attach timeout; attempt B gets the rest of this budget.
+# No fixed pre-attach sleep is added — without IPC there is no readiness signal to
+# wait for. Passed explicitly by agent/sync.py via `budget_seconds=`.
+COLD_START_CONNECT_BUDGET_SECONDS: float = 150.0
 # The attach-without-path attempt's own library timeout (ms). Short, because a
 # running, reachable terminal answers an attach in well under a second.
 ATTACH_TIMEOUT_MS: int = 20_000
@@ -150,6 +167,12 @@ WATCHDOG_TICK_SECONDS: float = 1.0
 # ever written by _call_with_watchdog() (set) and initialize_terminal() (cleared once
 # the thread has finished on its own).
 _abandoned_call: Optional[threading.Thread] = None
+
+# The `mt5.last_error()` tuple read when the most recent initialize_terminal() attempt
+# failed (None after a success). Reset at the start of every initialize_terminal()
+# call and written ONLY there, from the one last_error() read each failed attempt
+# already makes for its log line — never a second library call.
+_last_connect_error: Optional[Any] = None
 
 
 class TerminalUnresponsiveError(Exception):
@@ -249,12 +272,14 @@ def _log_terminal_info() -> None:
         logger.warning("terminal_info() returned None: %s", mt5.last_error())
         return
     logger.info(
-        "terminal_info: name=%s company=%s build=%s path=%s connected=%s",
+        "terminal_info: name=%s company=%s build=%s path=%s connected=%s trade_allowed=%s",
         getattr(info, "name", None),
         getattr(info, "company", None),
         getattr(info, "build", None),
         getattr(info, "path", None),
         getattr(info, "connected", None),
+        # «Алготрейдинг» switch state — a flag, not money.
+        getattr(info, "trade_allowed", None),
     )
 
 
@@ -266,10 +291,14 @@ def initialize_terminal(
     path: Optional[str] = None,
     *,
     on_tick: Optional[Callable[[int], None]] = None,
+    budget_seconds: Optional[float] = None,
 ) -> bool:
     """
     Attach to (or launch) the MT5 terminal, never for longer than
-    `CONNECT_BUDGET_SECONDS` in total.
+    `CONNECT_BUDGET_SECONDS` in total — or `budget_seconds` when given (agent/sync.py
+    passes `COLD_START_CONNECT_BUDGET_SECONDS` only when that run itself started the
+    terminal). After a False return, `last_connect_error_code()` gives the failing
+    attempt's MT5 error code.
 
     `path` should be the `terminal64.exe` path `terminal_discovery.find_terminal_path()`
     already located — pass it explicitly, or leave it `None` to let this function
@@ -294,7 +323,7 @@ def initialize_terminal(
     budget runs out, or immediately when a previous attempt's abandoned call is still
     blocked in the library.
     """
-    global _abandoned_call
+    global _abandoned_call, _last_connect_error
 
     if path is None:
         path = terminal_discovery.find_terminal_path()
@@ -320,8 +349,11 @@ def initialize_terminal(
         logger.info("the previously abandoned mt5.initialize() call has since finished; continuing")
         _abandoned_call = None
 
+    _last_connect_error = None
+    budget = CONNECT_BUDGET_SECONDS if budget_seconds is None else float(budget_seconds)
+    logger.info("connect: whole-connect budget %.0f s", budget)
     started_at = time.monotonic()
-    deadline = started_at + CONNECT_BUDGET_SECONDS
+    deadline = started_at + budget
 
     def _remaining_ms() -> int:
         return int((deadline - time.monotonic()) * 1000)
@@ -339,7 +371,8 @@ def initialize_terminal(
     if ok_a:
         _log_terminal_info()
         return True
-    logger.warning("connect attempt A last_error=%s", mt5.last_error())
+    _last_connect_error = mt5.last_error()
+    logger.warning("connect attempt A last_error=%s", _last_connect_error)
 
     if deadline - time.monotonic() < 1.0:
         logger.error(
@@ -358,10 +391,59 @@ def initialize_terminal(
     )
     logger.info("connect attempt B returned %s after %.1f s", ok_b, time.monotonic() - started_at)
     if ok_b:
+        _last_connect_error = None
         _log_terminal_info()
         return True
-    logger.error("connect attempt B last_error=%s — terminal not initialised", mt5.last_error())
+    _last_connect_error = mt5.last_error()
+    logger.error("connect attempt B last_error=%s — terminal not initialised", _last_connect_error)
     return False
+
+
+def last_connect_error_code() -> Optional[int]:
+    """
+    The MT5 error code of the attempt that made the most recent `initialize_terminal()`
+    return False — None after a successful connect, when the code is not an int, or
+    while an abandoned `mt5.initialize()` is still blocked (its outcome is unknown and
+    nothing about the library's state is trustworthy until it returns). Reads the tuple
+    captured during that call; never calls into the library itself.
+    """
+    if is_previous_call_still_blocked():
+        return None
+    err = _last_connect_error
+    if not err:
+        return None
+    try:
+        code = err[0]
+    except (TypeError, IndexError, KeyError):
+        return None
+    # bool is an int subclass; a True/False "code" is not a code.
+    if isinstance(code, bool) or not isinstance(code, int):
+        return None
+    return code
+
+
+def terminal_trade_allowed() -> Optional[bool]:
+    """
+    Whether «Алготрейдинг» (Algo Trading) is switched on in the attached terminal —
+    `terminal_info().trade_allowed`. None when MT5 is unavailable, when an abandoned
+    call is still blocked (no library call is made then), when `terminal_info()`
+    returns None or raises, or when the attribute is missing. Never raises.
+    """
+    if not MT5_AVAILABLE:
+        return None
+    if is_previous_call_still_blocked():
+        return None
+    try:
+        info = mt5.terminal_info()
+    except Exception as exc:  # noqa: BLE001 — a diagnostic read must never break a run
+        logger.warning("terminal_trade_allowed: terminal_info() raised %s", exc.__class__.__name__)
+        return None
+    if info is None:
+        return None
+    value = getattr(info, "trade_allowed", None)
+    if value is None:
+        return None
+    return bool(value)
 
 
 def shutdown_terminal() -> None:

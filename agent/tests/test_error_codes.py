@@ -78,7 +78,42 @@ def test_contested_minus_6_resolves_to_connection_error_never_auth_failed():
     """
     assert -6 in MT5_ERROR_CODES
     assert MT5_ERROR_CODES[-6].category is ErrorCategory.CONNECTION_ERROR
-    assert MT5_ERROR_CODES[-6].source is ErrorSource.ASSUMPTION
+
+
+def test_minus_6_is_confirmed_in_practice_by_the_2026_09_25_live_run():
+    """
+    Changed deliberately (quick 260925-qhs): the owner's live v0.2.0 run returned
+    (-6, 'Terminal: Authorization failed') from a BROKEN terminal install — a
+    non-credential cause — so the recoverable CONNECTION_ERROR side is now confirmed
+    in practice, not merely assumed. R-01 (closed account vs wrong password) stays
+    open: the code still cannot tell those apart.
+    """
+    info = MT5_ERROR_CODES[-6]
+    assert info.category is ErrorCategory.CONNECTION_ERROR
+    assert info.source is ErrorSource.CONFIRMED_IN_PRACTICE
+    assert "Terminal: Authorization failed" in info.note
+    assert info.suggests_algotrading_off_at_connect is False
+
+
+def test_minus_10005_carries_the_algotrading_off_connect_hint():
+    info = MT5_ERROR_CODES[-10005]
+    assert info.category is ErrorCategory.CONNECTION_ERROR
+    assert info.source is ErrorSource.CONFIRMED_IN_PRACTICE
+    assert info.suggests_algotrading_off_at_connect is True
+    assert "2026-09-25" in info.note
+
+
+def test_minus_10006_stays_an_assumption_and_records_it_was_not_observed():
+    info = MT5_ERROR_CODES[-10006]
+    assert info.source is ErrorSource.ASSUMPTION
+    assert "not observed in the 2026-09-25 live run" in info.note.lower()
+
+
+def test_the_connect_hint_flag_defaults_to_false():
+    info = ErrorCodeInfo(
+        category=ErrorCategory.CONNECTION_ERROR, source=ErrorSource.ASSUMPTION, note="x"
+    )
+    assert info.suggests_algotrading_off_at_connect is False
 
 
 def test_ambiguous_and_assumption_rows_never_resolve_to_a_retiring_category():

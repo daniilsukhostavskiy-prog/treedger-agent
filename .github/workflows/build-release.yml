@@ -1,6 +1,15 @@
 # Release pipeline — full test suite, real-DPAPI execution assertion, source ast
 # audit, Nuitka standalone build, blocking runtime observation, package + hash,
-# publish.
+# installer (Inno Setup) + hash, publish.
+#
+# Assets per release (quick 260925-qhs): the portable zip and its .sha256.txt
+# (unchanged), the Program Files installer treedger-agent-<tag>-windows-setup.exe and
+# its .sha256.txt, and runtime-observation.json. The installer wraps the SAME staged
+# Treedger/ folder the zip ships. The web route /download/agent prefers the setup.exe
+# when a release has one and falls back to the zip otherwise.
+# Run installer-smoke.yml by hand BEFORE tagging: it proves the .iss compiles,
+# installs, registers/removes autostart and uninstalls in ~2 minutes instead of a
+# ~38-minute release run.
 #
 # Every one of the steps below that can fail the release (full test suite, the
 # real-DPAPI execution assertion, the source ast structural audit, the blocking
@@ -86,8 +95,10 @@ jobs:
         # deliberately does NOT include the agent's own sources -- those compile in
         # seconds. numpy is the entire cost, and it changes only when its pin changes.
         #
-        # NOTE: the FIRST run after adding this is still a cold ~23 minutes, because it
-        # populates the cache. The saving appears from the second run onward.
+        # MEASURED 2026-09-25: this cache does NOT shorten the build. v0.2.0 (38m 03s)
+        # vs v0.1.0 (38m 31s) with an unchanged key that window probe #7 had populated.
+        # Kept only because removing it is its own decision; budget ~38 min per release.
+        # See 40-BUILD-EVIDENCE.md "The Nuitka cache".
         uses: actions/cache@v4
         with:
           path: ~\AppData\Local\Nuitka\Nuitka\Cache
@@ -214,7 +225,9 @@ jobs:
         # folder itself (not its contents with a wildcard) is what goes into
         # Compress-Archive, which is what produces the single top-level folder.
         # The asset name is unchanged: the web route /download/agent matches
-        # ^treedger-agent-.+-windows\.zip$.
+        # ^treedger-agent-.+-windows\.zip$ (as its fallback — it prefers the installer).
+        # release_staging/Treedger is ALSO the installer's source folder (next step), so
+        # the zip and the setup.exe always ship byte-identical program files.
         id: package
         shell: pwsh
         run: |
@@ -256,6 +269,57 @@ jobs:
           Add-Content -Path $env:GITHUB_OUTPUT -Value "archive_name=$archiveName"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "hash_file_name=$hashFileName"
 
+      - name: Build the installer (Inno Setup) + assert it exists
+        # quick 260925-qhs — Phase 40 D-13 revoked: the primary install path is now an
+        # Inno Setup installer into Program Files (packaging/installer/treedger.iss).
+        # ISCC comes preinstalled on the windows-latest image; only when it is absent
+        # is Inno Setup installed from Chocolatey, at an EXACT pinned version
+        # (6.7.1 — the version the windows-2025 image lists; its package page
+        # community.chocolatey.org/packages/innosetup/6.7.1 was checked 2026-09-25).
+        # The ISCC path is logged either way. Fails the release when the installer is
+        # missing or implausibly small (< 5 MB — the Nuitka payload alone is far larger).
+        id: installer
+        shell: pwsh
+        run: |
+          function Find-Iscc {
+            @(
+              (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+              (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            Write-Host "ISCC.exe not preinstalled - installing Inno Setup 6.7.1 (pinned) from Chocolatey"
+            choco install innosetup --version 6.7.1 -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup 6.7.1 failed with exit code $LASTEXITCODE" }
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw "ISCC.exe (Inno Setup 6) not found" }
+          Write-Host "ISCC: $iscc"
+          $tag = "${{ steps.package.outputs.tag }}"
+          $appVersion = $tag -replace '^v', ''
+          $baseName = "treedger-agent-$tag-windows-setup"
+          $sourceDir = (Resolve-Path "release_staging/Treedger").Path
+          $outDir = Join-Path (Get-Location).Path "installer_output"
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          & $iscc "/DAppVersion=$appVersion" "/DSourceDir=$sourceDir" "/O$outDir" "/F$baseName" "packaging/installer/treedger.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          $installerPath = Join-Path $outDir "$baseName.exe"
+          if (-not (Test-Path $installerPath)) { throw "Installer missing after ISCC: $installerPath" }
+          $size = (Get-Item $installerPath).Length
+          if ($size -le 5MB) { throw "Installer implausibly small ($size bytes): $installerPath" }
+          Write-Host "Installer OK: $installerPath ($size bytes)"
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $installerPath).Hash
+          $hashFile = "$baseName.exe.sha256.txt"
+          $commitSha = "${{ steps.structural_audit.outputs.commit_sha }}"
+          @(
+            "SHA-256: $hash",
+            "Installer: $baseName.exe",
+            "Audited commit: $commitSha"
+          ) -join [Environment]::NewLine | Set-Content -Path $hashFile -Encoding utf8
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "installer_path=$installerPath"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "installer_hash_file=$hashFile"
+
       - name: Publish release
         # gh (pre-installed on windows-latest) is used instead of a
         # third-party release-publishing Action deliberately: in a public
@@ -270,6 +334,8 @@ jobs:
           gh release create $tag `
             "${{ steps.package.outputs.archive_name }}" `
             "${{ steps.package.outputs.hash_file_name }}" `
+            "${{ steps.installer.outputs.installer_path }}" `
+            "${{ steps.installer.outputs.installer_hash_file }}" `
             "runtime-observation.json" `
             --title $tag `
             --notes "Audited commit: ${{ steps.structural_audit.outputs.commit_sha }}"

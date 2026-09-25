@@ -380,8 +380,11 @@ def test_protocol_too_old_event_disables_refresh() -> None:
 
 
 def test_protocol_too_old_notice_survives_every_subsequent_unrelated_event() -> None:
-    """"The pinned notice survives every subsequent unrelated event — notices only
-    ever grow, never shrink, exactly as the existing notices behave."""
+    """The pinned notice survives every subsequent event. Rule changed deliberately
+    by quick 260925-qhs: a notice is never removed by an UNRELATED event, only by the
+    one event that proves it stale — and nothing can prove protocol-too-old stale
+    (refresh stays disabled, no later run can happen against a server that refuses
+    this build), so this notice never clears within a session."""
     state = ui_state.UiState(screen=ui_state.SCREEN_READY)
 
     state = ui_state.reduce(state, ui_state.ProtocolTooOldEvent())
@@ -503,12 +506,155 @@ def test_unresponsive_text_has_seconds_and_windows_dialog_hint() -> None:
         ui_state.RUN_ERROR_LAUNCH_FAILED,
         ui_state.RUN_ERROR_SERVER,
         ui_state.RUN_ERROR_INTERNAL,
+        ui_state.RUN_ERROR_ALGO_TRADING,
     ],
 )
 def test_run_error_texts_never_name_a_button(kind: str) -> None:
     text = ui_state.run_error_text(kind, waited_seconds=5)
     assert text
     assert "«" not in text
+
+
+# ---------------------------------------------------------------------------
+# quick 260925-qhs — «Алготрейдинг» notice + run error
+# ---------------------------------------------------------------------------
+
+def _terminal_check(algo: "bool | None") -> "ui_state.AccountProgressEvent":
+    return ui_state.AccountProgressEvent(
+        mt_login=None, phase=ui_state.PHASE_TERMINAL_CHECK, algo_trading_allowed=algo
+    )
+
+
+def test_algo_trading_run_error_text_is_a_specific_instruction() -> None:
+    text = ui_state.run_error_text(ui_state.RUN_ERROR_ALGO_TRADING)
+    assert text.startswith("Включите „Алготрейдинг“ в терминале")
+    assert "Algo Trading" in text
+    assert "«" not in text
+    assert text != ui_state.run_error_text(ui_state.RUN_ERROR_TERMINAL_FAILED)
+
+
+def test_algo_trading_notice_text_resolves() -> None:
+    text = ui_state.NOTICE_TEXT[ui_state.NOTICE_ALGO_TRADING_OFF]
+    assert text.startswith("Включите „Алготрейдинг“ в терминале")
+    assert "Algo Trading" in text
+
+
+def test_run_failed_with_algo_kind_shows_the_instruction() -> None:
+    state = ui_state.reduce(_running_state(), ui_state.RunFailedEvent(kind=ui_state.RUN_ERROR_ALGO_TRADING))
+    assert state.run_error is not None
+    assert state.run_error.startswith("Включите „Алготрейдинг“ в терминале")
+
+
+def test_terminal_check_with_algo_off_pins_the_notice_and_on_removes_it() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY)
+
+    state = ui_state.reduce(state, _terminal_check(False))
+    assert ui_state.NOTICE_ALGO_TRADING_OFF in state.notices
+
+    # Unknown (None) leaves it where it was.
+    state = ui_state.reduce(state, _terminal_check(None))
+    assert ui_state.NOTICE_ALGO_TRADING_OFF in state.notices
+
+    state = ui_state.reduce(state, _terminal_check(True))
+    assert ui_state.NOTICE_ALGO_TRADING_OFF not in state.notices
+
+
+def test_terminal_check_with_unknown_algo_state_never_pins_the_notice() -> None:
+    state = ui_state.reduce(ui_state.UiState(screen=ui_state.SCREEN_READY), _terminal_check(None))
+    assert ui_state.NOTICE_ALGO_TRADING_OFF not in state.notices
+
+
+def test_account_progress_event_algo_field_is_last_and_defaults_to_none() -> None:
+    import dataclasses
+
+    fields = dataclasses.fields(ui_state.AccountProgressEvent)
+    assert fields[-1].name == "algo_trading_allowed"
+    assert ui_state.AccountProgressEvent(mt_login="1", phase=ui_state.PHASE_LOGIN).algo_trading_allowed is None
+
+
+# ---------------------------------------------------------------------------
+# quick 260925-qhs — stale notices are cleared by the event that proves them stale
+# ---------------------------------------------------------------------------
+
+def _revoked_state() -> "ui_state.UiState":
+    state = ui_state.reduce(ui_state.UiState(screen=ui_state.SCREEN_READY), ui_state.UnauthorizedEvent())
+    assert ui_state.NOTICE_TOKEN_REVOKED in state.notices
+    return state
+
+
+def test_token_revoked_is_cleared_by_a_successful_pairing() -> None:
+    state = ui_state.reduce(_revoked_state(), ui_state.PairingSucceededEvent())
+    assert ui_state.NOTICE_TOKEN_REVOKED not in state.notices
+
+
+def test_token_revoked_is_cleared_by_a_successful_account_list_fetch() -> None:
+    state = ui_state.reduce(
+        _revoked_state(),
+        ui_state.StageProgressEvent(stage=ui_state.STAGE_FETCH_ACCOUNTS, status=ui_state.STAGE_DONE, detail="1"),
+    )
+    assert ui_state.NOTICE_TOKEN_REVOKED not in state.notices
+
+
+def test_token_revoked_is_not_cleared_by_a_fetch_still_in_progress_or_failed() -> None:
+    for status in (ui_state.STAGE_IN_PROGRESS, ui_state.STAGE_FAILED):
+        state = ui_state.reduce(
+            _revoked_state(), ui_state.StageProgressEvent(stage=ui_state.STAGE_FETCH_ACCOUNTS, status=status)
+        )
+        assert ui_state.NOTICE_TOKEN_REVOKED in state.notices
+
+
+def test_token_revoked_is_cleared_by_a_run_with_at_least_one_success() -> None:
+    state = ui_state.reduce(_revoked_state(), ui_state.RunFinishedEvent(succeeded=1, failed=0))
+    assert ui_state.NOTICE_TOKEN_REVOKED not in state.notices
+
+
+def test_token_revoked_survives_unrelated_events_and_a_run_with_no_success() -> None:
+    state = _revoked_state()
+    for event in (
+        ui_state.RateLimitedEvent(retry_after_seconds=30),
+        ui_state.AccountProgressEvent(mt_login="1", phase=ui_state.PHASE_LOGIN),
+        ui_state.AccountProgressEvent(mt_login="1", phase=ui_state.PHASE_DONE, trades_sent=5),
+        ui_state.RunFinishedEvent(succeeded=0, failed=2),
+        ui_state.RunFinishedEvent(),
+        ui_state.StageProgressEvent(stage=ui_state.STAGE_CONNECT, status=ui_state.STAGE_DONE),
+    ):
+        state = ui_state.reduce(state, event)
+        assert ui_state.NOTICE_TOKEN_REVOKED in state.notices, event
+
+
+def test_no_terminal_is_cleared_once_a_run_found_the_terminal() -> None:
+    state = ui_state.reduce(ui_state.UiState(screen=ui_state.SCREEN_RUNNING), ui_state.TerminalNotFoundEvent())
+    assert ui_state.NOTICE_NO_TERMINAL in state.notices
+
+    unchanged = ui_state.reduce(
+        state, ui_state.StageProgressEvent(stage=ui_state.STAGE_FIND_TERMINAL, status=ui_state.STAGE_IN_PROGRESS)
+    )
+    assert ui_state.NOTICE_NO_TERMINAL in unchanged.notices
+
+    found = ui_state.reduce(
+        state,
+        ui_state.StageProgressEvent(
+            stage=ui_state.STAGE_FIND_TERMINAL, status=ui_state.STAGE_DONE, detail=r"C:\MT5\terminal64.exe"
+        ),
+    )
+    assert ui_state.NOTICE_NO_TERMINAL not in found.notices
+
+
+def test_terminal_switched_and_protocol_too_old_never_clear_on_the_new_clearing_events() -> None:
+    state = ui_state.UiState(
+        screen=ui_state.SCREEN_READY,
+        notices=frozenset({ui_state.NOTICE_TERMINAL_SWITCHED, ui_state.NOTICE_PROTOCOL_TOO_OLD}),
+    )
+    for event in (
+        ui_state.PairingSucceededEvent(),
+        ui_state.StageProgressEvent(stage=ui_state.STAGE_FETCH_ACCOUNTS, status=ui_state.STAGE_DONE, detail="1"),
+        ui_state.StageProgressEvent(stage=ui_state.STAGE_FIND_TERMINAL, status=ui_state.STAGE_DONE, detail="x"),
+        ui_state.RunFinishedEvent(succeeded=3),
+        _terminal_check(True),
+    ):
+        state = ui_state.reduce(state, event)
+        assert ui_state.NOTICE_TERMINAL_SWITCHED in state.notices, event
+        assert ui_state.NOTICE_PROTOCOL_TOO_OLD in state.notices, event
 
 
 def test_run_failed_from_ready_stays_on_ready() -> None:

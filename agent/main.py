@@ -37,6 +37,15 @@ top of the one file where it matters:
     calling through `_on_refresh_clicked`, the same main-thread entry point a
     manual click uses. It never touches a widget beyond what that call already
     does.
+  - `AgentWindow._on_startup_sync` (the one-shot sync STARTUP_SYNC_DELAY_SECONDS
+    after the window opens — quick 260925-qhs) is a `root.after` callback too, on
+    the main thread, and it also starts a sync only through `_on_refresh_clicked`.
+    It never reschedules itself.
+  - The clipboard key handler and the entry right-click menu (`_on_entry_control_key`,
+    `_show_entry_menu`, `_entry_menu_generate`) are Tk event/command callbacks on the
+    main thread. They only generate Tk's own <<Paste>>/<<Copy>>/<<Cut>>/<<SelectAll>>
+    virtual events on the entry — the clipboard text never enters Python and is never
+    logged.
 
 Do not "simplify" this by having the worker thread call a widget method directly,
 even for something that looks harmless (e.g. a one-line status update) — that is
@@ -45,10 +54,13 @@ loudly; it can just as easily corrupt Tk's internal state silently.
 
 WHAT THIS WINDOW DELIBERATELY DOES NOT DO
 --------------------------------------------------------------------------
-Autostart registration now exists, but it is opt-in only and never
-self-registering: the scheduler's CREATE verb is reachable from exactly one
-place, the checkbox's own handler, and the silent startup self-check may only
-repair an already-existing task's path, never create one. No tray icon and no
+Autostart registration exists, but it is opt-in only and never
+self-registering: it is ONE per-user HKCU Run value (no Task Scheduler, no
+administrator rights — quick 260925-qhs), `autostart.enable_autostart()` is
+reachable from exactly one place, the checkbox's own handler, and the silent
+startup self-check may only rewrite an already-existing value whose executable no
+longer exists, never create one. The installer's own «Запускать вместе с Windows»
+option writes the same value and is unchecked by default. No tray icon and no
 self-update check of any kind still hold — if a version notice is ever shown
 (the protocol-too-old notice below), it is plain text with a link the user
 follows themselves, never a download-and-execute path. This window also never
@@ -98,6 +110,24 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_MS = 100
 _SYNC_INTERVAL_MS = constants.SYNC_INTERVAL_SECONDS * 1000
+_STARTUP_SYNC_DELAY_MS = constants.STARTUP_SYNC_DELAY_SECONDS * 1000
+
+# Windows virtual-key codes → Tk's clipboard virtual events (quick 260925-qhs, brief
+# E1). Tk binds <<Paste>> & co. to LATIN keysyms, so under the Russian layout Ctrl+V
+# arrives as keysym "Cyrillic_em" and nothing pastes. `event.keycode` on Windows is the
+# virtual-key code, the same under every layout: V=86, C=67, X=88, A=65.
+_CLIPBOARD_VIRTUAL_EVENTS: "dict[int, str]" = {
+    86: "<<Paste>>",
+    67: "<<Copy>>",
+    88: "<<Cut>>",
+    65: "<<SelectAll>>",
+}
+
+
+def clipboard_virtual_event(keycode: int) -> Optional[str]:
+    """The Tk virtual event a Ctrl+<key> with this Windows virtual-key code means, or
+    None when it is not one of the four clipboard keys."""
+    return _CLIPBOARD_VIRTUAL_EVENTS.get(keycode)
 _DEFAULT_BASE_URL = "https://treedger.com"
 _MT5_DOWNLOAD_URL = "https://www.metatrader5.com/en/download"
 
@@ -142,15 +172,15 @@ class AgentWindow:
         # cross-thread object besides the queue.
         self._cancel_event: Optional[threading.Event] = None
 
-        # Silent, log-only self-check — see repair_task_path()'s own
-        # docstring for why this never surfaces a dialog: the person made no
-        # mistake, so there is nothing to tell them. Runs on every start,
-        # regardless of whether autostart is enabled — it only EDITS an
-        # already-existing task; it can never create one (see
-        # _on_autostart_toggled, the one place create_task() is ever called).
-        # Runs BEFORE the widgets are built, so a stale-path task is repaired first
-        # and the autostart checkbox then reflects the real, verified state.
-        logger.info("autostart path self-check: %s", autostart.repair_task_path())
+        # Silent, log-only self-check — see repair_autostart_path()'s own docstring
+        # for why this never surfaces a dialog: the person made no mistake, so there
+        # is nothing to tell them. Runs on every start, regardless of whether
+        # autostart is enabled — it only rewrites an ALREADY-EXISTING Run value whose
+        # executable no longer exists; it can never create one (see
+        # _on_autostart_toggled, the one place enable_autostart() is ever called).
+        # Runs BEFORE the widgets are built, so a dead path is repaired first and the
+        # autostart checkbox then reflects the real, verified state.
+        logger.info("autostart path self-check: %s", autostart.repair_autostart_path())
 
         self._build_widgets()
         self._render()
@@ -158,12 +188,33 @@ class AgentWindow:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(_POLL_INTERVAL_MS, self._poll_queue)
         self._schedule_periodic_sync()
+        # One sync shortly after the window opens, however it was launched (quick
+        # 260925-qhs — implements Phase 40 D-21's premise; never tied to --minimized).
+        self.root.after(_STARTUP_SYNC_DELAY_MS, self._on_startup_sync)
 
     # -----------------------------------------------------------------
     # Widget construction — built once. `_render()` only ever mutates these
     # existing widgets (text, colour, pack/forget); it never rebuilds them.
     # -----------------------------------------------------------------
     def _build_widgets(self) -> None:
+        # ONE shared right-click menu for every entry field; the entry it acts on is
+        # stored by _show_entry_menu at the moment of the click.
+        self._entry_menu_target: "Optional[tk.Widget]" = None
+        self._entry_menu = tk.Menu(self.root, tearoff=0)
+        self._entry_menu.add_command(
+            label="Вырезать", command=lambda: self._entry_menu_generate("<<Cut>>")
+        )
+        self._entry_menu.add_command(
+            label="Копировать", command=lambda: self._entry_menu_generate("<<Copy>>")
+        )
+        self._entry_menu.add_command(
+            label="Вставить", command=lambda: self._entry_menu_generate("<<Paste>>")
+        )
+        self._entry_menu.add_separator()
+        self._entry_menu.add_command(
+            label="Выделить всё", command=lambda: self._entry_menu_generate("<<SelectAll>>")
+        )
+
         self._notice_var = tk.StringVar(value="")
         self._notice_label = tk.Label(
             self.root,
@@ -197,13 +248,17 @@ class AgentWindow:
 
         tk.Label(frame, text="Адрес сервера").pack(anchor="w", padx=12, pady=(16, 0))
         self._base_url_var = tk.StringVar(value=config_store.load_base_url() or _DEFAULT_BASE_URL)
-        tk.Entry(frame, textvariable=self._base_url_var, width=44).pack(anchor="w", padx=12)
+        self._base_url_entry = tk.Entry(frame, textvariable=self._base_url_var, width=44)
+        self._base_url_entry.pack(anchor="w", padx=12)
+        self._install_entry_clipboard_support(self._base_url_entry)
 
         tk.Label(frame, text="Код привязки (из Настройки → Аккаунт → Программа синхронизации)").pack(
             anchor="w", padx=12, pady=(12, 0)
         )
         self._code_var = tk.StringVar(value="")
-        tk.Entry(frame, textvariable=self._code_var, width=44).pack(anchor="w", padx=12)
+        self._code_entry = tk.Entry(frame, textvariable=self._code_var, width=44)
+        self._code_entry.pack(anchor="w", padx=12)
+        self._install_entry_clipboard_support(self._code_entry)
 
         self._pairing_error_var = tk.StringVar(value="")
         tk.Label(
@@ -284,15 +339,16 @@ class AgentWindow:
         self._rows_container = tk.Frame(frame)
         self._rows_container.pack(fill="both", expand=True, padx=12, pady=(6, 14))
 
-        # Shows ONLY a verified state: ticked when a TreedgerAgent task is registered
-        # for THIS executable (autostart.task_is_registered_for_this_exe), never merely
-        # because some task of that name exists. The only place its own command
+        # Shows ONLY a verified state: ticked when the per-user TreedgerAgent Run value
+        # names THIS executable and Task Manager has not switched it off
+        # (autostart.autostart_enabled_for_this_exe), never merely because some value
+        # of that name exists. The only place its own command
         # handler (`_on_autostart_toggled`) ever runs is a click on THIS checkbox. The
         # label means one thing only — whether the window is open or not — never
         # whether the timer runs. Copy is the exact RU source-of-truth string from
         # `src/lib/i18n/dictionaries/ru.ts`'s `download.step7.toggleLabel`/`.note`, not
         # retyped from memory.
-        self._autostart_var = tk.BooleanVar(value=autostart.task_is_registered_for_this_exe())
+        self._autostart_var = tk.BooleanVar(value=autostart.autostart_enabled_for_this_exe())
         tk.Checkbutton(
             frame,
             text="Запускать вместе с Windows",
@@ -309,6 +365,49 @@ class AgentWindow:
             wraplength=520,
             justify="left",
         ).pack(anchor="w", padx=12, pady=(0, 8))
+
+    # -----------------------------------------------------------------
+    # Entry clipboard support — MAIN THREAD ONLY (Tk event/command callbacks).
+    # Layout-independent Ctrl+V/C/X/A plus a right-click menu (quick 260925-qhs,
+    # brief E1). Nothing here reads the clipboard into Python or logs anything.
+    # -----------------------------------------------------------------
+    def _install_entry_clipboard_support(self, entry: "tk.Entry") -> None:
+        """Bind the layout-independent clipboard keys and the right-click menu on ONE
+        entry. Called for every tk.Entry this window builds (ast-checked)."""
+        entry.bind("<Control-KeyPress>", self._on_entry_control_key)
+        entry.bind("<Button-3>", self._show_entry_menu)
+
+    def _on_entry_control_key(self, event: "tk.Event") -> Optional[str]:
+        """
+        Ctrl+<key> on an entry: when the Windows virtual-key code is V/C/X/A, generate
+        Tk's own virtual event on that entry and return "break". This binding lives on
+        the WIDGET bindtag, which Tk processes before the Entry CLASS bindtag, so
+        "break" stops the class binding — a Latin-layout Ctrl+V is therefore handled
+        here exactly once and never pastes a second time. Any other key: None, and Tk
+        carries on as usual.
+        """
+        virtual = clipboard_virtual_event(getattr(event, "keycode", -1))
+        if virtual is None:
+            return None
+        event.widget.event_generate(virtual)
+        return "break"
+
+    def _show_entry_menu(self, event: "tk.Event") -> None:
+        """Right-click on an entry: remember it as the menu's target, focus it, and
+        pop the shared menu up at the pointer. The grab is always released."""
+        self._entry_menu_target = event.widget
+        event.widget.focus_set()
+        try:
+            self._entry_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._entry_menu.grab_release()
+
+    def _entry_menu_generate(self, virtual: str) -> None:
+        """A menu command: the matching Tk virtual event on the right-clicked entry."""
+        target = self._entry_menu_target
+        if target is None:
+            return
+        target.event_generate(virtual)
 
     # -----------------------------------------------------------------
     # Rendering — MAIN THREAD ONLY. Called from __init__ and from `_dispatch`
@@ -470,25 +569,26 @@ class AgentWindow:
     def _on_autostart_toggled(self) -> None:
         """
         Tk command callback for the autostart checkbox — the ONLY place in this
-        entire program that ever calls `autostart.create_task()`. The
-        checkbox's own `tk.BooleanVar` already reflects the state the person just
+        entire program that ever calls `autostart.enable_autostart()` (ast-audited).
+        The checkbox's own `tk.BooleanVar` already reflects the state the person just
         requested by clicking it, so this handler acts on that value: calls
-        `create_task()` exactly once when it reads True, `remove_task()` exactly
-        once when it reads False. Never called from `__init__` — the silent
-        startup self-check (`autostart.repair_task_path()`) can only edit an
-        already-existing task, never create one; this handler is the sole
+        `enable_autostart()` exactly once when it reads True, `disable_autostart()`
+        exactly once when it reads False. Never called from `__init__` — the silent
+        startup self-check (`autostart.repair_autostart_path()`) can only rewrite an
+        already-existing Run value, never create one; this handler is the sole
         create-capable path, matching `agent/autostart.py`'s own structural split.
+        No administrator rights are involved: the value lives under HKCU.
 
-        Afterwards the checkbox is set to the RE-QUERIED, verified state — so a
-        create that "succeeded" but left no task for this exe (or a remove that did
-        not take) never leaves the box showing a state that is not real.
+        Afterwards the checkbox is set to the RE-READ, verified state — so a write
+        that failed, or a value Task Manager has switched off, never leaves the box
+        showing a state that is not real.
         """
         requested = bool(self._autostart_var.get())
         if requested:
-            autostart.create_task()
+            autostart.enable_autostart()
         else:
-            autostart.remove_task()
-        actual = autostart.task_is_registered_for_this_exe()
+            autostart.disable_autostart()
+        actual = autostart.autostart_enabled_for_this_exe()
         if actual != requested:
             logger.warning(
                 "autostart toggle: requested=%s but the verified state is %s", requested, actual
@@ -524,6 +624,7 @@ class AgentWindow:
                     error_reason=progress.error_reason,
                     account_id=progress.account_id,
                     pre_existing_session=progress.pre_existing_session,
+                    algo_trading_allowed=getattr(progress, "algo_trading_allowed", None),
                 )
             )
 
@@ -586,6 +687,12 @@ class AgentWindow:
                     waited_seconds=exc.waited_seconds,
                 )
             )
+        except sync.AlgoTradingSuspectedError as exc:
+            # MUST precede SyncAbortedError: AlgoTradingSuspectedError is its subclass
+            # (quick 260925-qhs) — swap the order and every «Алготрейдинг»-off connect
+            # failure silently shows the generic «Не удалось подключиться…» line.
+            logger.error("sync run: connect failed, algo-trading suspected (code=%s): %s", exc.error_code, exc)
+            self._queue.put(ui_state.RunFailedEvent(kind=ui_state.RUN_ERROR_ALGO_TRADING))
         except sync.TerminalLaunchError as exc:
             # MUST precede SyncAbortedError: TerminalLaunchError is its subclass.
             logger.error("sync run: terminal launch failed: %s (cause: %r)", exc, exc.__cause__)
@@ -637,12 +744,12 @@ class AgentWindow:
         again by `_on_periodic_tick` itself after every subsequent tick, so the
         timer keeps running for as long as this window stays open.
 
-        The first tick fires a full interval AFTER launch, never AT launch: the
-        window's own startup already triggers the first sync run (the person's own
-        first «Синхронизировать» click, or the terminal-check phase already visible when
-        the window opens), and scheduling a second one immediately would make two
-        overlapping runs the very first thing this program does on every single
-        launch.
+        The first tick fires a full interval AFTER launch, never AT launch (PKG40-15).
+        The sync at launch is a separate one-shot, `_on_startup_sync`, scheduled
+        `agent.constants.STARTUP_SYNC_DELAY_SECONDS` after the window opens (quick
+        260925-qhs). Until then this docstring claimed "the window's own startup
+        already triggers the first sync run" — that was false in code: nothing
+        synced until this hourly tick, which broke the unattended logon chain.
 
         Runs regardless of whether autostart is enabled or how the program was
         launched — see `agent/constants.py`'s own docstring for why the timer is
@@ -672,6 +779,21 @@ class AgentWindow:
         if not self._sync_in_flight:
             self._on_refresh_clicked()
         self._schedule_periodic_sync()
+
+    def _on_startup_sync(self) -> None:
+        """
+        One-shot `root.after` callback (main thread), scheduled once from `__init__`
+        `agent.constants.STARTUP_SYNC_DELAY_SECONDS` after the window opens — however
+        the program was launched, minimized or not (the `--minimized` flag still
+        changes only the initial window state). Starts a sync through
+        `_on_refresh_clicked`, the one method that starts a worker thread, and only
+        when no sync is already in flight; `_on_refresh_clicked`'s own guards (refresh
+        disabled, no pairing yet) still apply. Never reschedules itself — the hourly
+        timer is separate.
+        """
+        logger.info("startup sync")
+        if not self._sync_in_flight:
+            self._on_refresh_clicked()
 
     # -----------------------------------------------------------------
     # Shutdown
@@ -737,7 +859,7 @@ def parse_argv(argv: "list[str]") -> "WindowLaunchOptions":
     argument is to print a usage message and call `sys.exit(2)`, which directly
     contradicts the requirement above that anything on the command line other than
     the one recognised flag is ignored, never fatal — whatever launched this
-    program (a shortcut, Task Scheduler, a person's own typo) must never crash
+    program (a shortcut, the Windows autostart entry, a person's own typo) must never crash
     it. A plain membership test over the argument list is the correct tool for
     "recognise exactly one flag, ignore everything else, never raise". Do not
     "improve" this into argparse; that reintroduces the exact failure mode this

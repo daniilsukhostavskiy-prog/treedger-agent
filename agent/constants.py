@@ -2,10 +2,21 @@
 agent/constants.py — the periodic-sync and staleness tuning constants, and ONLY those
 tuning constants.
 
-This module holds exactly two module-level values: the fixed periodic-sync interval
-and the silence threshold the SITE uses to flag a stale agent. It has no imports at
-all — it is a leaf module, checked by an `ast` audit, so nothing that reads these two
-numbers can ever drag in anything else transitively.
+This module holds exactly three module-level values: the fixed periodic-sync interval,
+the one-shot startup-sync delay, and the silence threshold the SITE uses to flag a
+stale agent. It has no imports at all — it is a leaf module, checked by an `ast`
+audit, so nothing that reads these numbers can ever drag in anything else
+transitively.
+
+`STARTUP_SYNC_DELAY_SECONDS` (quick 260925-qhs)
+----------------------------------------------------------------------------------
+Phase 40's D-21 assumed "the startup sync already happens when the window opens" —
+in code, nothing synced until the first hourly tick. This delay implements that
+premise: one sync starts by itself this many seconds after the window opens. It runs
+however the program was launched — never tied to `--minimized` and never tied to the
+autostart checkbox, so the minimized flag keeps changing only the initial window
+state. It is a ONE-SHOT: the hourly timer's own first tick still fires one full
+interval after launch (PKG40-15), it does not move.
 
 WHY THESE LIVE HERE AND NOT AS A THIRD `config.json` KEY
 ----------------------------------------------------------------------------------
@@ -16,7 +27,7 @@ not worth breaking that rule for: it is a value the program should simply always
 correctly, not a setting somebody sets once, forgets about, and later can't explain.
 
 `SYNC_INTERVAL_SECONDS` is also deliberately NOT tied to the autostart checkbox
-(Task Scheduler registration). Autostart controls whether the program launches on
+(the per-user HKCU Run value, agent/autostart.py). Autostart controls whether the program launches on
 login; the sync timer controls whether an already-open window keeps syncing. Wiring
 the two together would produce a state that is impossible to explain to a user: the
 program open, visible, working — and syncing nothing, because a checkbox whose
@@ -42,7 +53,7 @@ WHAT IS DELIBERATELY NOT HERE
 ----------------------------------------------------------------------------------
 `AGENT_PROTOCOL_VERSION`, `MAX_TRADES_PER_BATCH`, `_CONNECT_TIMEOUT_SECONDS` and
 `_READ_TIMEOUT_SECONDS` all currently live inline in `agent/api_client.py`. This
-module's own scope is the two NEW constants only — moving those existing,
+module's own scope is its own sync/staleness constants only — moving those existing,
 working constants here for tidiness alone, so close to this folder moving to
 its own repository, is out of scope. Do not "finish the job" by migrating them.
 """
@@ -50,6 +61,10 @@ its own repository, is out of scope. Do not "finish the job" by migrating them.
 # A fixed one-hour periodic sync, always, while the program's window is open —
 # never tied to the autostart checkbox. See the module docstring above for why.
 SYNC_INTERVAL_SECONDS: int = 3600
+
+# One sync this many seconds after the window opens, however it was launched — a
+# one-shot, the hourly timer is unaffected. See the module docstring above.
+STARTUP_SYNC_DELAY_SECONDS: int = 15
 
 # The agent-side transcription of `AGENT_STALE_AFTER_HOURS` in
 # src/lib/constants/agent.ts, the value the SITE actually reads and acts on. Change

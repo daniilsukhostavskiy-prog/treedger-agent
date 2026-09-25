@@ -11,6 +11,8 @@ owner's.
 | `agent/packaging/README.md` (this file) | `packaging/README.md`, or delete after the move — it is the move instruction sheet, not part of the running program |
 | `agent/packaging/github-workflows/probe-window.yml` | `.github/workflows/probe-window.yml` |
 | `agent/packaging/github-workflows/build-release.yml` | `.github/workflows/build-release.yml` |
+| `agent/packaging/github-workflows/installer-smoke.yml` | `.github/workflows/installer-smoke.yml` (quick 260925-qhs) |
+| `agent/packaging/installer/treedger.iss` | `packaging/installer/treedger.iss` (quick 260925-qhs) |
 | `agent/packaging/observe_runtime.ps1` | `packaging/observe_runtime.ps1` |
 | `agent/packaging/assert_dpapi_executed.py` | `packaging/assert_dpapi_executed.py` |
 | `agent/.gitignore` | `.gitignore` (repo root) |
@@ -34,11 +36,15 @@ files resolve against.
    where they are. Do NOT flatten its contents into the root — see the warning below.
 3. Move `agent/packaging/` OUT of the package, to `packaging/` at the new repository's root,
    so that `agent/` is left as a pure importable package. Then move
-   `packaging/github-workflows/probe-window.yml` and
-   `packaging/github-workflows/build-release.yml` into a new `.github/workflows/`
-   directory at the root. `packaging/observe_runtime.ps1` and
-   `packaging/assert_dpapi_executed.py` stay under `packaging/` at the new root — the
-   workflows reference them at that path.
+   `packaging/github-workflows/probe-window.yml`,
+   `packaging/github-workflows/build-release.yml` and
+   `packaging/github-workflows/installer-smoke.yml` into a new `.github/workflows/`
+   directory at the root. `packaging/observe_runtime.ps1`,
+   `packaging/assert_dpapi_executed.py` and `packaging/installer/treedger.iss` stay under
+   `packaging/` at the new root — the workflows reference them at that path (and
+   `agent/tests/test_installer_script.py` looks for the `.iss` at
+   `../packaging/installer/treedger.iss` relative to the package, failing — never
+   skipping — when it is missing).
 4. Copy `packaging/root_main.py` to the new repository's root, renaming it to `main.py`.
    This three-line shim (`from agent.main import main`) is the build entry point, so
    Nuitka's standalone output folder is `build_output/main.dist/` — a build-internal name
@@ -55,8 +61,9 @@ files resolve against.
 
 ```
 treedger-agent/
-├── .github/workflows/{probe-window.yml, build-release.yml}
-├── packaging/{observe_runtime.ps1, assert_dpapi_executed.py, README.md, root_main.py}
+├── .github/workflows/{probe-window.yml, build-release.yml, installer-smoke.yml}
+├── packaging/{observe_runtime.ps1, assert_dpapi_executed.py, README.md, root_main.py,
+│              installer/treedger.iss}
 ├── agent/          ← moved whole and unedited: __init__.py, *.py, tests/,
 │                     pytest.ini, requirements.txt, README.md, CHECKLIST-RU.md
 ├── main.py         ← packaging/root_main.py, renamed
@@ -81,7 +88,52 @@ with `Treedger/` and `Treedger/Treedger.exe` exists. The asset name pattern is u
 Releases up to and including v0.1.0 used the old layout (`main.exe` plus ~980 files at the
 archive root).
 
-### Why the package must not be flattened
+### Installer (quick 260925-qhs)
+
+Phase 40 D-13 (a per-user `%LOCALAPPDATA%` folder, never admin) is **revoked** by the
+owner: the primary install path is now an Inno Setup installer into Program Files, one
+UAC prompt at install/update, so no process running as the user can silently overwrite
+the exe. `packaging/installer/treedger.iss`:
+
+- installs the same staged `Treedger/` folder the zip ships into `{autopf}\Treedger`
+  (per-machine only — no per-user override);
+- refuses to install or uninstall while the program runs (`AppMutex` = the program's own
+  single-instance mutex); closes nothing, ever — the MetaTrader 5 terminal lives outside
+  the install folder;
+- offers two tasks, both **unchecked** by default: a desktop shortcut and «Запускать
+  вместе с Windows» (the same HKCU `Run` value `TreedgerAgent` the in-app checkbox
+  writes, with the same warning text);
+- starts the program at the end **non-elevated** (`runasoriginaluser`);
+- on uninstall removes files, shortcuts and the autostart value (also one the in-app
+  checkbox created), deletes a leftover `TreedgerAgent` scheduled task from the old
+  autostart mechanism, and **keeps** `%APPDATA%\TreedgerAgent` (per-user token, settings,
+  logs).
+
+Assets per release: `treedger-agent-<tag>-windows.zip` + its `.sha256.txt` (portable,
+unchanged), `treedger-agent-<tag>-windows-setup.exe` + its `.sha256.txt`, and
+`runtime-observation.json` — five in total. ISCC is preinstalled on `windows-latest`;
+both workflows fall back to `choco install innosetup --version 6.7.1` only when it is
+absent.
+
+The web change needs **no hold**: `/download/agent` and the `/download` wizard already
+choose the setup.exe when the latest release has one and fall back to the zip (with the
+zip instructions, size and hash) when it does not — so the site can deploy before the
+first installer tag.
+
+## Release checklist
+
+1. Push the copied files to `treedger-agent`.
+2. Run `installer-smoke.yml` by hand (Actions → Installer smoke test → Run workflow).
+   It must be green before anything is tagged.
+3. Tag `vX.Y.Z` and push the tag.
+4. Wait for `build-release.yml` (~38 min).
+5. Verify the release has all five assets and that each asset's GitHub digest
+   (`gh release view vX.Y.Z --json assets`) equals the hash in its `.sha256.txt`.
+6. Open `https://treedger.com/download/agent` and confirm it downloads the
+   `-windows-setup.exe`.
+7. The owner walks `agent/CHECKLIST-RU.md` → «Шаг 4».
+
+## Why the package must not be flattened
 
 The first version of this sheet said to copy the CONTENTS of `agent/` to the root. That is
 wrong, and probe run #2 (`treedger-agent@dd1ef43`) is the proof: the executable built
@@ -117,7 +169,7 @@ makes `agent` importable in CI without any `PYTHONPATH` set.
 
 ## What must never happen in `tradeproof` (this repository)
 
-`.github/` must NOT be created in this repository under any circumstances. The two CI
+`.github/` must NOT be created in this repository under any circumstances. The three CI
 workflow files above are staged as a plain `packaging/github-workflows/` folder
 precisely so GitHub Actions in `tradeproof` never picks them up and never runs them
 here — they only start running once they land under `.github/workflows/` in the public

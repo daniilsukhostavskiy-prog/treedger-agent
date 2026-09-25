@@ -158,6 +158,7 @@ def stub_bridge(monkeypatch: pytest.MonkeyPatch):
 
         def initialize_terminal(self, path=None, **_kwargs):
             self.initialize_calls.append(path)
+            self.initialize_kwargs.append(dict(_kwargs))
             self.call_order.append(("initialize", path))
             on_tick = _kwargs.get("on_tick")
             if on_tick is not None:
@@ -169,6 +170,12 @@ def stub_bridge(monkeypatch: pytest.MonkeyPatch):
 
         def current_logged_in_account(self):
             return self.pre_existing_session
+
+        def last_connect_error_code(self):
+            return self.connect_error_code
+
+        def terminal_trade_allowed(self):
+            return self.trade_allowed
 
         def find_terminal_path(self):
             return self.terminal_path
@@ -200,7 +207,10 @@ def stub_bridge(monkeypatch: pytest.MonkeyPatch):
     stub.launch_calls = []
     stub.launch_raises = None
     stub.initialize_calls = []
+    stub.initialize_kwargs = []
     stub.initialize_raises = None
+    stub.connect_error_code = None
+    stub.trade_allowed = True
     stub.call_order = []
     stub.ticks = []
     monkeypatch.setattr(terminal_discovery, "find_terminal_path", stub.find_terminal_path)
@@ -215,6 +225,8 @@ def stub_bridge(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(mt5_bridge, "get_initial_stop_and_take_profit", stub.get_initial_stop_and_take_profit)
     monkeypatch.setattr(mt5_bridge, "initialize_terminal", stub.initialize_terminal)
     monkeypatch.setattr(mt5_bridge, "current_logged_in_account", stub.current_logged_in_account)
+    monkeypatch.setattr(mt5_bridge, "last_connect_error_code", stub.last_connect_error_code)
+    monkeypatch.setattr(mt5_bridge, "terminal_trade_allowed", stub.terminal_trade_allowed)
     return stub
 
 
@@ -687,6 +699,101 @@ def test_failed_connect_reports_connect_failed_before_raising(stub_bridge) -> No
     assert rec.stages()[-1] == (sync.STAGE_CONNECT, sync.STAGE_FAILED)
 
 
+# ---------------------------------------------------------------------------
+# quick 260925-qhs — cold-start budget, «Алготрейдинг» connect hint, trade_allowed
+# ---------------------------------------------------------------------------
+
+def test_launched_terminal_gets_the_cold_start_connect_budget(stub_bridge) -> None:
+    stub_bridge.running = []
+
+    sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert stub_bridge.initialize_kwargs[0].get("budget_seconds") == (
+        mt5_bridge.COLD_START_CONNECT_BUDGET_SECONDS
+    )
+
+
+def test_already_running_terminal_passes_no_budget_keyword(stub_bridge) -> None:
+    sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert "budget_seconds" not in stub_bridge.initialize_kwargs[0]
+
+
+def test_launched_terminal_still_passes_on_tick_with_the_budget(stub_bridge) -> None:
+    stub_bridge.running = []
+    rec = _StageRecorder()
+
+    sync.run_sync(_empty_fetch_client(), rec.report, report_stage=rec.stage)
+
+    kwargs = stub_bridge.initialize_kwargs[0]
+    assert callable(kwargs.get("on_tick"))
+    assert kwargs.get("budget_seconds") == mt5_bridge.COLD_START_CONNECT_BUDGET_SECONDS
+
+
+def test_connect_failure_with_algo_hint_code_raises_algo_trading_suspected(stub_bridge) -> None:
+    stub_bridge.initialize_ok = False
+    stub_bridge.connect_error_code = -10005
+    rec = _StageRecorder()
+
+    with pytest.raises(sync.AlgoTradingSuspectedError) as info:
+        sync.run_sync(_empty_fetch_client(), rec.report, report_stage=rec.stage)
+
+    assert info.value.error_code == -10005
+    assert isinstance(info.value, sync.SyncAbortedError)
+    assert rec.stages()[-1] == (sync.STAGE_CONNECT, sync.STAGE_FAILED)
+
+
+def test_connect_failure_with_minus_6_raises_plain_sync_aborted(stub_bridge) -> None:
+    stub_bridge.initialize_ok = False
+    stub_bridge.connect_error_code = -6
+
+    with pytest.raises(sync.SyncAbortedError) as info:
+        sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert not isinstance(info.value, sync.AlgoTradingSuspectedError)
+
+
+def test_connect_failure_with_unknown_code_raises_plain_sync_aborted(stub_bridge) -> None:
+    stub_bridge.initialize_ok = False
+    stub_bridge.connect_error_code = None
+
+    with pytest.raises(sync.SyncAbortedError) as info:
+        sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert not isinstance(info.value, sync.AlgoTradingSuspectedError)
+
+
+def test_trade_not_allowed_is_reported_on_terminal_check_and_run_continues(stub_bridge) -> None:
+    stub_bridge.trade_allowed = False
+    reporter = _Reporter()
+
+    summary = sync.run_sync(_two_account_client(), reporter)
+
+    terminal_check = [e for e in reporter.events if e.phase == sync.PHASE_TERMINAL_CHECK]
+    assert len(terminal_check) == 1
+    assert terminal_check[0].algo_trading_allowed is False
+    assert summary.total == 2
+    walked = {e.account_id for e in reporter.events if e.phase == sync.PHASE_LOGIN}
+    assert walked == {"acc-1", "acc-2"}
+
+
+def test_trade_allowed_true_and_unknown_are_forwarded_verbatim(stub_bridge) -> None:
+    for value in (True, None):
+        stub_bridge.trade_allowed = value
+        reporter = _Reporter()
+        sync.run_sync(_empty_fetch_client(), reporter)
+        terminal_check = [e for e in reporter.events if e.phase == sync.PHASE_TERMINAL_CHECK]
+        assert terminal_check[0].algo_trading_allowed is value
+
+
+def test_account_progress_algo_field_is_last_and_defaults_to_none() -> None:
+    import dataclasses
+
+    fields = dataclasses.fields(sync.AccountProgress)
+    assert fields[-1].name == "algo_trading_allowed"
+    assert sync.AccountProgress(account_id=None, mt_login=None, phase="x").algo_trading_allowed is None
+
+
 def test_cancel_during_fetch_raises_after_token_saved_with_no_logins(
     stub_bridge, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -898,31 +1005,6 @@ def _docstring_constant_ids(tree: ast.Module) -> "set[int]":
         ):
             ids.add(id(first.value))
     return ids
-
-
-class _StringConstantVisitor(_FunctionScopeVisitor):
-    """
-    Every string `Constant` node equal to `value`, tagged with its enclosing
-    function, EXCLUDING the docstring-position constants named in
-    `docstring_ids` — so a docstring that names the forbidden value in prose
-    is invisible to this visitor, verified by a dedicated negative test
-    rather than merely assumed.
-    """
-
-    def __init__(self, value: str, docstring_ids: "set[int]") -> None:
-        super().__init__()
-        self._value = value
-        self._docstring_ids = docstring_ids
-        self.matches: "list[tuple[ast.AST, Optional[ast.AST]]]" = []
-
-    def visit_Constant(self, node: ast.Constant) -> None:  # noqa: N802
-        if (
-            isinstance(node.value, str)
-            and node.value == self._value
-            and id(node) not in self._docstring_ids
-        ):
-            self.matches.append((node, self._current_function()))
-        self.generic_visit(node)
 
 
 # ---- order-sending MT5 API surface (converted from a text search) ---------
@@ -1260,80 +1342,75 @@ def _argv_offenders(files: "list[pathlib.Path]") -> "list[str]":
     return offenders
 
 
-# ---- the autostart CREATE verb has exactly one home -------------------------
+# ---- the autostart registry write has exactly one home ---------------------
+#
+# quick 260925-qhs: autostart is a per-user HKCU Run value, no longer a Task
+# Scheduler entry. The claim keeps its shape: the one thing that can put this program
+# into Windows autostart (a registry SetValueEx) lives in exactly one function, and the
+# one function allowed to CREATE an autostart entry has exactly one caller — the
+# checkbox handler.
 
-_SCHEDULER_CREATE_VERB = "/Create"
+_AUTOSTART_ENABLE_FUNC = "enable_autostart"
+_AUTOSTART_ENABLE_HOME = ("main.py", "_on_autostart_toggled")
+_REGISTRY_WRITE_ATTR = "SetValueEx"
+_REGISTRY_WRITE_HOME = ("autostart.py", "_write_own_command")
 
 
-class _CreateTaskCallVisitor(_FunctionScopeVisitor):
-    """Every call whose target resolves to `autostart.create_task` — an
-    `Attribute` access, since every caller reaches it through the module."""
+class _AttributeCallVisitor(_FunctionScopeVisitor):
+    """Every call whose target is an `Attribute` named `attr` (e.g.
+    `autostart.enable_autostart(...)`, `_winreg.SetValueEx(...)`), tagged with its
+    enclosing function. A docstring or comment naming the same word is not a Call node
+    and is therefore invisible here."""
 
-    def __init__(self) -> None:
+    def __init__(self, attr: str) -> None:
         super().__init__()
+        self._attr = attr
         self.calls: "list[tuple[ast.AST, Optional[ast.AST]]]" = []
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
         func = node.func
-        if isinstance(func, ast.Attribute) and func.attr == "create_task":
+        if isinstance(func, ast.Attribute) and func.attr == self._attr:
             self.calls.append((node, self._current_function()))
         self.generic_visit(node)
 
 
-def _create_task_call_sites(
-    files: "list[pathlib.Path]",
+def _attribute_call_sites(
+    files: "list[pathlib.Path]", attr: str
 ) -> "list[tuple[pathlib.Path, ast.AST, Optional[ast.AST]]]":
     sites: "list[tuple[pathlib.Path, ast.AST, Optional[ast.AST]]]" = []
     for path in files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        visitor = _CreateTaskCallVisitor()
+        visitor = _AttributeCallVisitor(attr)
         visitor.visit(tree)
         for call_node, func_node in visitor.calls:
             sites.append((path, call_node, func_node))
     return sites
 
 
-def _scheduler_verb_constant_sites(
-    files: "list[pathlib.Path]",
-) -> "list[tuple[pathlib.Path, ast.AST, Optional[ast.AST]]]":
-    sites: "list[tuple[pathlib.Path, ast.AST, Optional[ast.AST]]]" = []
-    for path in files:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        docstring_ids = _docstring_constant_ids(tree)
-        visitor = _StringConstantVisitor(_SCHEDULER_CREATE_VERB, docstring_ids)
-        visitor.visit(tree)
-        for node, func_node in visitor.matches:
-            sites.append((path, node, func_node))
-    return sites
+def _single_home_offenders(
+    files: "list[pathlib.Path]", attr: str, home: "tuple[str, str]", what: str
+) -> "list[str]":
+    sites = _attribute_call_sites(files, attr)
+    if len(sites) != 1:
+        return [
+            f"expected exactly one {what} ({attr}(...)) call site, found {len(sites)}: "
+            + ", ".join(f"{p}:{n.lineno} in {_function_label(f)}" for p, n, f in sites)
+        ]
+    path, node, func = sites[0]
+    if (path.name, _function_label(func)) != home:
+        return [
+            f"{path}:{node.lineno} the only {what} ({attr}(...)) lives in "
+            f"{path.name}:{_function_label(func)}, expected {home[0]}:{home[1]}"
+        ]
+    return []
 
 
-def _scheduler_create_offenders(files: "list[pathlib.Path]") -> "list[str]":
-    offenders: "list[str]" = []
-
-    call_sites = _create_task_call_sites(files)
-    if len(call_sites) != 1:
-        offenders.append(
-            "expected exactly one call site for autostart.create_task(...), found "
-            f"{len(call_sites)}: " + ", ".join(f"{p}:{n.lineno}" for p, n, _ in call_sites)
-        )
-
-    verb_sites = _scheduler_verb_constant_sites(files)
-    if len(verb_sites) != 1:
-        offenders.append(
-            f"expected exactly one occurrence of the {_SCHEDULER_CREATE_VERB!r} scheduler "
-            f"verb constant, found {len(verb_sites)}: "
-            + ", ".join(f"{p}:{n.lineno}" for p, n, _ in verb_sites)
-        )
-    else:
-        verb_path, verb_node, verb_func = verb_sites[0]
-        if verb_path.name != "autostart.py" or _function_label(verb_func) != "create_task":
-            offenders.append(
-                f"{verb_path}:{verb_node.lineno} the {_SCHEDULER_CREATE_VERB!r} verb constant "
-                f"lives outside agent/autostart.py's create_task() "
-                f"(in {_function_label(verb_func)})"
-            )
-
-    return offenders
+def _autostart_write_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    return _single_home_offenders(
+        files, _AUTOSTART_ENABLE_FUNC, _AUTOSTART_ENABLE_HOME, "autostart enable"
+    ) + _single_home_offenders(
+        files, _REGISTRY_WRITE_ATTR, _REGISTRY_WRITE_HOME, "registry write"
+    )
 
 
 # ---- the single-instance lock is always the first thing that happens ------
@@ -1437,15 +1514,18 @@ class TestAgentFolderStructuralAudit:
         exactly two narrow, documented, non-credential shapes; nothing else
         in the tree reads it, and the launch-options builder itself never
         extracts a raw command-line element into a string field.
-    11. The Windows Task Scheduler CREATE verb — and the one function that
-        issues it — each appear in exactly one place in the whole tree, and
-        that place is the same single function.
+    11. The registry write that puts this program into Windows autostart
+        (`SetValueEx`) appears in exactly one function in the whole tree
+        (`autostart._write_own_command`), and the one function allowed to create
+        an autostart value (`autostart.enable_autostart`) has exactly one caller,
+        the checkbox handler (quick 260925-qhs: HKCU Run value, no longer a Task
+        Scheduler entry).
     12. The single-instance lock is the very first call the program's entry
         point makes — before the command line is parsed, before the
         configuration file is touched, and before the GUI toolkit's own root
         window is constructed.
     13. No call anywhere passes a `shell` keyword — every process this program
-        starts (the MT5 terminal, `schtasks`) is started from an argument list.
+        starts (the MT5 terminal) is started from an argument list.
     """
 
     @staticmethod
@@ -1836,70 +1916,93 @@ class TestAgentFolderStructuralAudit:
             "a parse_argv() that indexes into argv to build a string field must be reported"
         )
 
-    def test_scheduler_creation_has_exactly_one_call_site(self, tmp_path: pathlib.Path) -> None:
+    def test_autostart_write_has_exactly_one_home(self, tmp_path: pathlib.Path) -> None:
         """
-        `agent/autostart.py`'s `create_task()` is the ONLY function in this whole
-        program that issues the Windows Task Scheduler CREATE verb, and it is called
-        from exactly one place (the autostart checkbox's own handler in
-        `agent/main.py`) — never from the silent startup self-check. A program that can
-        write itself into Windows autostart from more than one code path behaves like
-        malware; this makes that structurally impossible rather than merely
-        conventional. The verb is collected as a string-`Constant` NODE, never a text
-        match, specifically so a comment or docstring that NAMES the verb (to explain
-        this very rule, as this docstring itself does) is invisible to it — proven
-        below, not merely asserted.
+        Claim 11 (rewritten by quick 260925-qhs for the HKCU Run-value mechanism). The
+        registry write that puts this program into Windows autostart (`SetValueEx`)
+        appears exactly once in the whole tree, inside `agent/autostart.py`'s
+        `_write_own_command()`, and `autostart.enable_autostart()` — the only function
+        allowed to CREATE an autostart value — is called from exactly one place, the
+        checkbox handler `_on_autostart_toggled` in `agent/main.py`, never from the
+        silent startup self-check. A program that can write itself into Windows
+        autostart from more than one code path behaves like malware; this makes that
+        structurally impossible rather than merely conventional. Both are collected as
+        `Call` NODES, never a text match, so a comment or docstring that names them (to
+        explain this very rule, as this docstring does) is invisible — proven below.
         """
-        offenders = _scheduler_create_offenders(self._agent_source_files())
-        assert not offenders, f"scheduler-creation call-site claim violated: {offenders}"
+        offenders = _autostart_write_offenders(self._agent_source_files())
+        assert not offenders, f"autostart single-home claim violated: {offenders}"
 
-        second_caller_dir = tmp_path / "second_caller"
-        second_caller_dir.mkdir()
-        second_caller = second_caller_dir / "rogue.py"
-        second_caller.write_text(
-            "from agent import autostart\n\n"
-            "def self_register():\n"
-            "    autostart.create_task()\n",
-            encoding="utf-8",
-        )
-        real_call_site_dir = tmp_path / "real_call_site"
-        real_call_site_dir.mkdir()
-        real_call_site = real_call_site_dir / "main.py"
-        real_call_site.write_text(
+        def _write(name: str, filename: str, body: str) -> pathlib.Path:
+            folder = tmp_path / name
+            folder.mkdir()
+            path = folder / filename
+            path.write_text(body, encoding="utf-8")
+            return path
+
+        real_caller = _write(
+            "real_caller",
+            "main.py",
             "from agent import autostart\n\n"
             "def _on_autostart_toggled():\n"
-            "    autostart.create_task()\n",
-            encoding="utf-8",
+            "    autostart.enable_autostart()\n",
         )
-        create_task_home_dir = tmp_path / "create_task_home"
-        create_task_home_dir.mkdir()
-        create_task_home = create_task_home_dir / "autostart.py"
-        create_task_home.write_text(
-            "def create_task():\n"
-            "    verb = '/Create'\n"
-            "    return verb\n",
-            encoding="utf-8",
+        real_writer = _write(
+            "real_writer",
+            "autostart.py",
+            "_winreg = None\n\n"
+            "def _write_own_command():\n"
+            "    _winreg.SetValueEx(None, 'TreedgerAgent', 0, 1, 'x')\n",
         )
-        assert _scheduler_create_offenders(
-            [second_caller, real_call_site, create_task_home]
-        ), "a second autostart.create_task() call site must be reported"
+        assert not _autostart_write_offenders([real_caller, real_writer])
 
-        comment_plus_real_dir = tmp_path / "comment_plus_real"
-        comment_plus_real_dir.mkdir()
-        comment_plus_real = comment_plus_real_dir / "autostart.py"
-        comment_plus_real.write_text(
-            "# This module's OTHER function never issues /Create; only create_task()\n"
-            "# does, exactly once below.\n"
-            "def repair_task_path():\n"
-            "    return None\n\n"
-            "def create_task():\n"
-            "    verb = '/Create'\n"
-            "    return verb\n",
-            encoding="utf-8",
+        second_caller = _write(
+            "second_caller",
+            "rogue.py",
+            "from agent import autostart\n\n"
+            "def self_register():\n"
+            "    autostart.enable_autostart()\n",
         )
-        verb_sites = _scheduler_verb_constant_sites([comment_plus_real])
-        assert len(verb_sites) == 1, (
-            "a comment mentioning the verb must not be counted alongside the one real "
-            f"occurrence: {verb_sites}"
+        assert _autostart_write_offenders([second_caller, real_caller, real_writer]), (
+            "a second autostart.enable_autostart() call site must be reported"
+        )
+
+        startup_caller = _write(
+            "startup_caller",
+            "main.py",
+            "from agent import autostart\n\n"
+            "def __init__():\n"
+            "    autostart.enable_autostart()\n",
+        )
+        assert _autostart_write_offenders([startup_caller, real_writer]), (
+            "enable_autostart() called from anywhere but the checkbox handler must be reported"
+        )
+
+        second_writer = _write(
+            "second_writer",
+            "autostart.py",
+            "_winreg = None\n\n"
+            "def _write_own_command():\n"
+            "    _winreg.SetValueEx(None, 'TreedgerAgent', 0, 1, 'x')\n\n"
+            "def repair_autostart_path():\n"
+            "    _winreg.SetValueEx(None, 'TreedgerAgent', 0, 1, 'y')\n",
+        )
+        assert _autostart_write_offenders([real_caller, second_writer]), (
+            "a second SetValueEx call must be reported"
+        )
+
+        prose_only = _write(
+            "prose_only",
+            "autostart.py",
+            '"""Only _write_own_command() calls SetValueEx; enable_autostart() is called '
+            'only by the checkbox handler."""\n'
+            "# SetValueEx enable_autostart\n"
+            "_winreg = None\n\n"
+            "def _write_own_command():\n"
+            "    _winreg.SetValueEx(None, 'TreedgerAgent', 0, 1, 'x')\n",
+        )
+        assert not _autostart_write_offenders([real_caller, prose_only]), (
+            "a docstring/comment naming the rule must not be counted"
         )
 
     def test_single_instance_lock_precedes_any_work(self, tmp_path: pathlib.Path) -> None:

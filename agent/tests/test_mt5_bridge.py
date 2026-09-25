@@ -719,7 +719,7 @@ def test_shutdown_is_skipped_while_abandoned_call_alive(monkeypatch, caplog):
 def test_terminal_info_logging_is_a_narrow_whitelist(monkeypatch, caplog):
     info = types.SimpleNamespace(
         name="MetaTrader 5", company="Broker Ltd", build=4755, path=r"C:\MT5",
-        connected=True, community_balance=987.65,
+        connected=True, trade_allowed=False, community_balance=987.65,
     )
     fake = _FakeInitMt5([True], terminal_info=info)
     _install(monkeypatch, fake)
@@ -729,5 +729,153 @@ def test_terminal_info_logging_is_a_narrow_whitelist(monkeypatch, caplog):
 
     assert "build=4755" in caplog.text
     assert "connected=True" in caplog.text
+    assert "trade_allowed=False" in caplog.text
     assert "987.65" not in caplog.text
     assert all("987.65" not in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# quick 260925-qhs — algo-trading connect hint, cold-start budget, last connect
+# error code, terminal_trade_allowed()
+# ---------------------------------------------------------------------------
+
+
+class _SequencedErrorMt5(_FakeInitMt5):
+    """Like _FakeInitMt5, but successive last_error() reads return `errors` in order."""
+
+    def __init__(self, results, errors, **kwargs):
+        super().__init__(results, **kwargs)
+        self._errors = list(errors)
+
+    def last_error(self):
+        self.calls.append(("last_error", (), {}))
+        return self._errors.pop(0) if self._errors else (1, "Success")
+
+
+def test_algotrading_connect_hint_codes_derive_from_the_table():
+    hint = mt5_bridge.ALGOTRADING_CONNECT_HINT_CODES
+    assert -10005 in hint
+    assert -10006 in hint
+    assert -8 in hint
+    assert -6 not in hint
+    assert isinstance(hint, frozenset)
+
+
+def test_cold_start_budget_is_larger_than_the_default_budget():
+    assert mt5_bridge.COLD_START_CONNECT_BUDGET_SECONDS == 150.0
+    assert mt5_bridge.COLD_START_CONNECT_BUDGET_SECONDS > mt5_bridge.CONNECT_BUDGET_SECONDS
+
+
+def _attempt_b_timeout_ms(fake) -> int:
+    init_calls = [c for c in fake.calls if c[0] == "initialize"]
+    assert len(init_calls) == 2
+    return int(init_calls[1][2]["timeout"])
+
+
+def test_budget_seconds_gives_attempt_b_a_longer_library_timeout(monkeypatch):
+    fake = _FakeInitMt5([False, True])
+    _install(monkeypatch, fake)
+
+    assert mt5_bridge.initialize_terminal(_PATH, budget_seconds=150) is True
+
+    default_ceiling_ms = int(mt5_bridge.CONNECT_BUDGET_SECONDS * 1000)
+    assert _attempt_b_timeout_ms(fake) > default_ceiling_ms
+
+
+def test_without_budget_seconds_the_default_budget_is_unchanged(monkeypatch):
+    fake = _FakeInitMt5([False, True])
+    _install(monkeypatch, fake)
+
+    assert mt5_bridge.initialize_terminal(_PATH) is True
+
+    default_ceiling_ms = int(mt5_bridge.CONNECT_BUDGET_SECONDS * 1000)
+    assert _attempt_b_timeout_ms(fake) <= default_ceiling_ms
+    # Attempt A's own timeout is still the short attach timeout.
+    init_calls = [c for c in fake.calls if c[0] == "initialize"]
+    assert init_calls[0][2]["timeout"] == mt5_bridge.ATTACH_TIMEOUT_MS
+
+
+def test_last_connect_error_code_is_the_failing_attempts_code_read_once_each(monkeypatch):
+    fake = _SequencedErrorMt5([False, False], [(-10005, "IPC timeout"), (-6, "Terminal: Authorization failed")])
+    _install(monkeypatch, fake)
+
+    assert mt5_bridge.initialize_terminal(_PATH) is False
+
+    assert mt5_bridge.last_connect_error_code() == -6
+    # ONE last_error() read per failed attempt — never a second call for the log line.
+    assert [c[0] for c in fake.calls].count("last_error") == 2
+
+
+def test_last_connect_error_code_is_none_after_a_successful_connect(monkeypatch):
+    failing = _SequencedErrorMt5([False, False], [(-10005, "IPC timeout"), (-10005, "IPC timeout")])
+    _install(monkeypatch, failing)
+    assert mt5_bridge.initialize_terminal(_PATH) is False
+    assert mt5_bridge.last_connect_error_code() == -10005
+
+    succeeding = _SequencedErrorMt5([False, True], [(-10005, "IPC timeout")])
+    _install(monkeypatch, succeeding)
+    assert mt5_bridge.initialize_terminal(_PATH) is True
+    assert mt5_bridge.last_connect_error_code() is None
+
+
+def test_last_connect_error_code_is_none_for_a_non_int_code(monkeypatch):
+    fake = _SequencedErrorMt5([False, False], [("x", "odd"), None])
+    _install(monkeypatch, fake)
+    assert mt5_bridge.initialize_terminal(_PATH) is False
+    assert mt5_bridge.last_connect_error_code() is None
+
+
+def test_last_connect_error_code_is_none_while_an_abandoned_call_is_blocked(monkeypatch):
+    fake = _SequencedErrorMt5([False, False], [(-10005, "IPC timeout"), (-10005, "IPC timeout")])
+    _install(monkeypatch, fake)
+    assert mt5_bridge.initialize_terminal(_PATH) is False
+    assert mt5_bridge.last_connect_error_code() == -10005
+
+    release = threading.Event()
+    _RELEASE_EVENTS.append(release)
+    blocked = threading.Thread(target=release.wait, args=(10,), daemon=True)
+    blocked.start()
+    monkeypatch.setattr(mt5_bridge, "_abandoned_call", blocked)
+
+    assert mt5_bridge.last_connect_error_code() is None
+
+
+@pytest.mark.parametrize(
+    ("info", "expected"),
+    [
+        (types.SimpleNamespace(trade_allowed=True), True),
+        (types.SimpleNamespace(trade_allowed=False), False),
+        (types.SimpleNamespace(), None),
+        (None, None),
+    ],
+)
+def test_terminal_trade_allowed_reads_terminal_info(monkeypatch, info, expected):
+    fake = _FakeInitMt5([], terminal_info=info)
+    _install(monkeypatch, fake)
+    assert mt5_bridge.terminal_trade_allowed() is expected
+
+
+def test_terminal_trade_allowed_is_none_when_mt5_unavailable(mt5_unavailable):
+    assert mt5_bridge.terminal_trade_allowed() is None
+
+
+def test_terminal_trade_allowed_never_raises(monkeypatch):
+    class _Raising(_FakeInitMt5):
+        def terminal_info(self):
+            raise RuntimeError("ipc gone")
+
+    _install(monkeypatch, _Raising([]))
+    assert mt5_bridge.terminal_trade_allowed() is None
+
+
+def test_terminal_trade_allowed_is_none_and_silent_while_blocked(monkeypatch):
+    fake = _FakeInitMt5([], terminal_info=types.SimpleNamespace(trade_allowed=True))
+    _install(monkeypatch, fake)
+    release = threading.Event()
+    _RELEASE_EVENTS.append(release)
+    blocked = threading.Thread(target=release.wait, args=(10,), daemon=True)
+    blocked.start()
+    monkeypatch.setattr(mt5_bridge, "_abandoned_call", blocked)
+
+    assert mt5_bridge.terminal_trade_allowed() is None
+    assert fake.calls == []

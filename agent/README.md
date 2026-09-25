@@ -52,16 +52,35 @@ python -m pytest agent/tests/test_sync.py -k StructuralAudit -q
 
 ## Running it
 
-There are two ways to run this program. Most people want the first one.
+There are three ways to run this program. Most people want the first one.
 
-### The released executable
+### The installer (recommended)
 
-Download the release archive from this repository's Releases page and unzip it. Open the
-`Treedger` folder inside and run `Treedger.exe` — keep every other file in that folder
-beside it (the program needs them; do not move `Treedger.exe` out on its own). See
-**Where it installs** and **Verifying what you downloaded** below before you run it for the
-first time. No Python installation is needed for this path; the folder is self-contained,
-and no console window opens.
+Download `treedger-agent-<version>-windows-setup.exe` from this repository's Releases page
+(or via treedger.com/download, which always serves the latest one) and run it:
+
+1. Windows SmartScreen may warn that the publisher is unknown (the program is not
+   code-signed) — «Подробнее» → «Выполнить в любом случае».
+2. Windows asks for permission to make changes to the device (UAC) — «Да». This is the
+   only administrator prompt, once per install or update: the program goes into
+   `C:\Program Files\Treedger`.
+3. Choose the language, keep the folder, and decide on the two options — a desktop
+   shortcut and «Запускать вместе с Windows». **Both are off by default.**
+4. At the end the program starts by itself — as your normal user, not as administrator.
+
+Updating is the same: run the new installer. If the program is open, the installer asks
+you to close it first; your pairing and settings are kept.
+
+### The portable archive (alternative)
+
+Download `treedger-agent-<version>-windows.zip`, unzip it, open the `Treedger` folder
+inside and run `Treedger.exe` — keep every other file in that folder beside it (the
+program needs them; do not move `Treedger.exe` out on its own). This copy lives wherever
+you unzip it, so it carries the residual risk described below.
+
+For either path, see **Where it installs** and **Verifying what you downloaded** below
+before you run it for the first time. No Python installation is needed; no console window
+opens.
 
 ### From source (for development)
 
@@ -87,10 +106,21 @@ the repository root.
 
 ## Where it installs
 
-The released executable installs to `%LOCALAPPDATA%\Programs\TreedgerAgent` — a folder
-your own Windows account already owns. The program never needs, and never asks for,
-administrator rights, which means you can drop a new version in yourself, at any time,
-with no UAC elevation prompt.
+The installer puts the program into `C:\Program Files\Treedger` (per machine) — a folder
+only an administrator can write to, so no program running under your account can quietly
+replace `Treedger.exe`. That is why installing and updating ask for one UAC confirmation.
+
+**Changed 2026-09-25 (quick 260925-qhs, owner decision):** Phase 40's decision D-13 — a
+per-user `%LOCALAPPDATA%\Programs\TreedgerAgent` folder that never needs admin — is
+**revoked**. The owner's reason: in a user-writable folder any process under the same
+account can silently overwrite the exe, and with autostart that is a ready re-execution
+point; Program Files needs admin to write. One UAC prompt at install/update is an
+acceptable price.
+
+What did not change: the program itself never needs administrator rights to **run**, and
+your settings and token stay in your own profile, `%APPDATA%\TreedgerAgent` (the token
+DPAPI-encrypted for your Windows account). The portable zip still exists as an
+alternative; it lives wherever you unzip it.
 
 ## Verifying what you downloaded
 
@@ -106,9 +136,10 @@ pretends to guard itself. Two ways of adding one were considered and rejected:
 - **Remembering the file's hash at the moment autostart is enabled.** Useless: a process
   able to replace the `.exe` can rewrite whatever file is holding the remembered hash,
   too.
-- **Checking the install folder's permissions.** Also useless: the folder above is always
-  writable by its own owner by design (that is what "no admin rights" means), so the
-  warning would be permanent, and a permanent warning stops being read within a week.
+- **Checking the install folder's permissions.** Also useless: for the installed copy
+  Program Files already does the job (writing there needs admin), and a portable copy's
+  folder is always writable by its owner by design, so the warning would be permanent —
+  and a permanent warning stops being read within a week.
 
 The general rule behind both rejections: **a mechanism that creates a feeling of
 protection without providing it is worse than no mechanism — it obstructs sober
@@ -116,14 +147,22 @@ assessment of the residual risk and spends the user's trust for nothing.**
 
 ## The residual risk (read this)
 
-Any process running under your own Windows account can overwrite this program's `.exe`
-file, and turning on **Запускать вместе с Windows** (see below) makes such a substitution
-persistent — it would run again at every login, undetected. The program does not check
-for this and does not try to.
+**Installed copy (Program Files).** Replacing `Treedger.exe` needs administrator rights,
+so a process running under your own account can no longer swap the file that autostart
+launches. What remains: the pairing token is protected with Windows DPAPI, which is
+bound to your Windows account — any process running as you can still ask Windows to
+decrypt it, exactly as before. The autostart entry itself is a per-user registry value
+that any process running as you could rewrite, just as it could add its own; the program
+only ever writes its own path there and never re-points an entry at another existing
+copy.
 
-Two things would close this gap, and both are deliberately deferred, not forgotten: an
-installer that places the program in a system-owned directory (which needs administrator
-rights to write to, unlike the per-user folder above), and code-signing the executable.
+**Portable copy (zip).** Everything above about the token applies, and additionally any
+process running under your account can overwrite the unzipped `.exe`; turning on
+**Запускать вместе с Windows** makes such a substitution persistent — it would run again
+at every login, undetected. The program does not check for this and does not try to.
+Use the installer if that matters to you.
+
+Code-signing the executable is still deliberately deferred, not forgotten.
 
 ## Autostart and periodic sync
 
@@ -133,13 +172,53 @@ meaning — it does not change how often the program syncs, and it does not put 
 into any special "background" mode; a minimised window is the exact same program, just
 iconified.
 
-The program syncs once an hour while its window is open, however it was launched —
-manually or via autostart.
+About 15 seconds after the window opens, the program starts one sync by itself, and then
+syncs once an hour while its window is open — however it was launched, manually or via
+autostart, minimised or not. `--minimized` (what autostart passes) changes only the
+window's initial state. Together that makes the unattended chain: log into Windows → the
+program opens minimised → it syncs ~15 s later, starting MetaTrader 5 minimised if it is
+not running → every hour after that.
 
-The checkbox shows the real state of the Windows scheduled task: it reads as ticked only
-when a `TreedgerAgent` task exists AND points at this very executable. After every click
-the program re-reads the task and shows what is actually registered. A task left pointing
-at an old folder is repaired silently on start (never created), and only then shown.
+How it works (quick 260925-qhs): autostart is ONE per-user registry value,
+`TreedgerAgent`, under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, with the data
+`"<path to Treedger.exe>" --minimized`. It needs no administrator rights. (Until then it
+was a Windows Task Scheduler task, which failed for standard users with "Access is
+denied" — that mechanism is gone; the installer removes a leftover task.) You can see and
+switch the entry in Task Manager → «Автозагрузка приложений».
+
+The checkbox shows the real state: it reads as ticked only when the value exists, points
+at this very executable, AND has not been switched off in Task Manager. After every click
+the program re-reads the registry and shows what is actually there. On every start a
+silent self-check repairs the value only when the executable it names no longer exists
+(for example after the folder was moved); it never creates a value and never re-points a
+value at another copy that still exists. The installer's own «Запускать вместе с Windows»
+option (unchecked by default) writes the very same value.
+
+## Uninstalling
+
+Use «Приложения» / «Программы и компоненты» → Treedger → Удалить (the same prompt to close
+the program appears if it is running). This removes the program folder, the shortcuts and
+the autostart entry — also one created by the in-app checkbox.
+
+It deliberately **keeps** `%APPDATA%\TreedgerAgent` — your pairing token, settings and logs
+(per-user data; the uninstaller runs as administrator, possibly under another profile). To
+remove everything: delete that folder yourself, and revoke the pairing in Treedger under
+**Настройки → Аккаунт → Программа синхронизации**.
+
+## What the first live run established (2026-09-25)
+
+The owner ran the packaged v0.2.0 against a real MetaTrader 5 terminal and a real account
+on their own machine; one account synced and 5 trades arrived in the journal.
+
+- The infinite hang in `mt5.initialize` is gone: attach-first plus timeouts plus the
+  abandoned-call refusal turned it into clear errors within fractions of a second.
+- «Алготрейдинг» OFF means **no connection at all** — `(-10005, 'IPC timeout')` after 20 s
+  (attempt A) and 88 s (attempt B); `-10006` was not observed. The window now says
+  «Включите „Алготрейдинг“ в терминале…» in that case instead of a generic failure.
+- `(-6, 'Terminal: Authorization failed')` came from a **broken terminal install**, not a
+  wrong password (a reinstall fixed it) — so an error code still cannot tell a closed
+  account, a wrong password and a broken install apart (R-01 stays open).
+- Terminal discovery found `C:\Program Files\MetaTrader 5\terminal64.exe` on that machine.
 
 ## Single instance
 
@@ -150,7 +229,7 @@ never starts a second connection to your MT5 terminal.
 ### First run, step by step
 
 1. Install MetaTrader 5 (with at least one account already added to it), and get the
-   program by one of the two methods above.
+   program by one of the methods above (the installer is simplest).
 2. In Treedger, open **Настройки → Аккаунт → Программа синхронизации** and press
    **«Привязать программу»**. This generates a short-lived, single-use pairing code — no
    port is ever opened on your computer to receive it, and no browser redirect is
@@ -174,8 +253,9 @@ non-crashing notice instead of the account list — see **Troubleshooting** belo
   - **Поиск терминала** — with the path of the `terminal64.exe` that was found;
   - **Запуск терминала** — only when the program had to start MetaTrader 5 itself;
   - **Подключение к терминалу** — with a live seconds counter. It can never run forever:
-    after about 90 seconds the run stops with «Терминал MetaTrader 5 не отвечает…» and a
-    hint to look for a Windows dialog hidden behind other windows;
+    after about 90 seconds (150 seconds when the program has just started MetaTrader 5
+    itself — a cold start is slower) the run stops with «Терминал MetaTrader 5 не
+    отвечает…» and a hint to look for a Windows dialog hidden behind other windows;
   - **Получение списка счетов** — with the number of accounts found;
   - then one row per account (see below).
 - **«Отменить»** stops the run *after the current step* — a call already waiting on the
@@ -248,16 +328,16 @@ MetaTrader 5 is actually installed on this machine (not just a shortcut to a por
 elsewhere), then restart the program — there is no configuration option to point it at a
 path manually, by design.
 
-**«Алготрейдинг» (algo-trading disabled)** — the program recognises MT5 error code
-`-10006` and shows a dedicated message telling you to enable algo-trading in your
-terminal. What is **confirmed**: the program handles this exact code with its own branch
-rather than lumping it in with a generic connection error. What is **not established**:
-whether the algo-trading setting actually gates a *read-only history pull* at all — this
-program never places, modifies or closes trades, and no live probe has yet run to confirm
-or rule out that MT5 requires algo-trading to be on even for read-only account/history
-access. Do not treat either direction (that it definitely gates history reads, or that it
-definitely doesn't) as established fact from this program's behaviour alone; the honest
-answer today is "unconfirmed, pending a real-terminal probe."
+**«Включите „Алготрейдинг“ в терминале…»** — **confirmed live 2026-09-25**: with the
+terminal's «Алготрейдинг» (Algo Trading) button off, the program cannot connect to the
+terminal at all — `mt5.initialize()` fails with `-10005` ('IPC timeout'), not just a
+history read. When a connect fails with `-10005` (or `-10006`/`-8`, which the tables name
+for algo-trading), the window shows this instruction instead of the generic «Не удалось
+подключиться…»; when the connection works but the terminal reports `trade_allowed=False`,
+the same instruction is pinned as a notice and the run continues. Turn the button on
+(green) and sync again. The same code can occasionally come from a very slow terminal
+start — if «Алготрейдинг» is already on, send `agent.log`. The program still never
+places, modifies or closes a trade; the investor password is read-only either way.
 
 **"The program switched my terminal account"** — this is expected, not a bug. On startup,
 the program checks whether an account was already logged into your terminal and, if so,
@@ -274,12 +354,16 @@ stays on the pairing screen; request a fresh code from Treedger and try again.
 
 **A revoked token** — if your token is revoked from Treedger (or the server otherwise
 refuses it), the window clears its locally stored token and returns to the pairing screen
-automatically the next time it tries to sync. Pair again with a fresh code to continue.
+automatically the next time it tries to sync. Pair again with a fresh code to continue —
+the «Токен был отозван…» notice disappears as soon as the pairing succeeds.
+
+**Pasting the pairing code** — Ctrl+V, Ctrl+C, Ctrl+X and Ctrl+A work in both fields under
+any keyboard layout (including Russian), and a right-click opens «Вырезать / Копировать /
+Вставить / Выделить всё».
 
 ## What this program deliberately does not include
 
-- No installer.
-- No code signing.
+- No code signing (the installer exists since quick 260925-qhs; it is not signed either).
 - No tray icon — the program only ever shows its one window (minimised or not).
 - No support for an account's live open positions — only closed-trade history is read
   and sent.

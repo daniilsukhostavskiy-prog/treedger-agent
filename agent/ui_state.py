@@ -124,15 +124,37 @@ def stage_line(stage_state: StageState) -> str:
     return f"{icon} {label} — {suffix}" if suffix else f"{icon} {label}"
 
 # ---------------------------------------------------------------------------
-# Pinned notices — a small, closed set. Once a notice is pinned it is NEVER removed
-# by a later, unrelated event — a pinned notice persists for the remainder of the
-# run, by design — `UiState.notices` only
-# ever grows across a reduce() call, never shrinks.
+# Pinned notices — a small, closed set. A pinned notice is NEVER removed by an
+# UNRELATED event; it is removed only by the one event that proves it stale. (Until
+# quick 260925-qhs the rule was "notices only ever grow", which left «Токен был
+# отозван…» pinned above a successful sync that had just sent 5 trades — brief E2.)
+#
+#   TOKEN_REVOKED     cleared by PairingSucceededEvent, by StageProgressEvent
+#                     (fetch_accounts, done) — the current token was just accepted —
+#                     and by RunFinishedEvent with succeeded >= 1.
+#   NO_TERMINAL       cleared by StageProgressEvent(find_terminal, done) — a later
+#                     run found the terminal.
+#   ALGO_TRADING_OFF  pinned/cleared by the terminal-check event's
+#                     algo_trading_allowed (False pins, True clears, None = unknown).
+#   TERMINAL_SWITCHED never cleared: "the program switched accounts in your terminal"
+#                     stays a true fact about this session.
+#   PROTOCOL_TOO_OLD  never cleared: refresh stays disabled, so no later run can
+#                     ever prove it wrong.
 # ---------------------------------------------------------------------------
 NOTICE_TERMINAL_SWITCHED = "terminal_switched"
 NOTICE_TOKEN_REVOKED = "token_revoked"
 NOTICE_NO_TERMINAL = "no_terminal"
 NOTICE_PROTOCOL_TOO_OLD = "protocol_too_old"
+NOTICE_ALGO_TRADING_OFF = "algo_trading_off"
+
+# The «Алготрейдинг» instruction, shared by the pinned notice and the run-error line.
+# German-style „“ quotes on purpose: the run-error texts must stay free of «» (which
+# this window reserves for naming its own buttons — see run_error_text).
+_ALGO_TRADING_INSTRUCTION = (
+    "Включите „Алготрейдинг“ в терминале MetaTrader 5: кнопка „Алготрейдинг“ "
+    "(Algo Trading) на панели инструментов терминала — зелёная, когда включена. "
+    "Без него программа не может подключиться к терминалу."
+)
 
 # The product's own step-by-step download page.
 # Transcribed by hand, matching `agent/main.py`'s own `_DEFAULT_BASE_URL`
@@ -158,6 +180,7 @@ NOTICE_TEXT: "dict[str, str]" = {
         f"Программа устарела. Она больше не может синхронизировать данные с сервером. "
         f"Скачайте новую версию: {DOWNLOAD_URL}"
     ),
+    NOTICE_ALGO_TRADING_OFF: _ALGO_TRADING_INSTRUCTION,
 }
 
 # ---------------------------------------------------------------------------
@@ -171,6 +194,9 @@ RUN_ERROR_TERMINAL_FAILED = "terminal_failed"
 RUN_ERROR_LAUNCH_FAILED = "launch_failed"
 RUN_ERROR_SERVER = "server"
 RUN_ERROR_INTERNAL = "internal"
+# The connect failed with a code that most often means «Алготрейдинг» is off
+# (agent.sync.AlgoTradingSuspectedError — quick 260925-qhs).
+RUN_ERROR_ALGO_TRADING = "algo_trading"
 
 _ELEVATION_HINT = (
     "Похоже, MetaTrader 5 запущен от имени администратора, а эта программа — нет, "
@@ -204,6 +230,11 @@ def run_error_text(
         return "Не удалось запустить MetaTrader 5. Подробности — в журнале программы."
     if kind == RUN_ERROR_SERVER:
         return "Не удалось связаться с сервером Treedger. Повторите синхронизацию позже."
+    if kind == RUN_ERROR_ALGO_TRADING:
+        return (
+            f"{_ALGO_TRADING_INSTRUCTION} Затем повторите синхронизацию. Если "
+            "„Алготрейдинг“ уже включён — подробности в журнале программы."
+        )
     return "Непредвиденная ошибка. Подробности — в журнале программы."
 
 
@@ -329,6 +360,9 @@ class AccountProgressEvent:
     error_reason: Optional[str] = None
     account_id: Optional[str] = None
     pre_existing_session: Optional[dict] = None
+    # Only on the terminal-check event: False pins NOTICE_ALGO_TRADING_OFF, True
+    # clears it, None leaves the notices unchanged. Kept LAST (quick 260925-qhs).
+    algo_trading_allowed: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -526,6 +560,10 @@ def reduce(state: UiState, event: Event) -> UiState:
             notices = state.notices
             if event.pre_existing_session is not None:
                 notices = notices | {NOTICE_TERMINAL_SWITCHED}
+            if event.algo_trading_allowed is False:
+                notices = notices | {NOTICE_ALGO_TRADING_OFF}
+            elif event.algo_trading_allowed is True:
+                notices = notices - {NOTICE_ALGO_TRADING_OFF}
             return replace(
                 state,
                 screen=SCREEN_RUNNING,
@@ -549,7 +587,14 @@ def reduce(state: UiState, event: Event) -> UiState:
         return replace(state, rows=rows)
 
     if isinstance(event, PairingSucceededEvent):
-        return replace(state, screen=SCREEN_READY, rows=dict(state.rows), pairing_error=None)
+        # A fresh token was just issued — «Токен был отозван» is stale now.
+        return replace(
+            state,
+            screen=SCREEN_READY,
+            rows=dict(state.rows),
+            notices=state.notices - {NOTICE_TOKEN_REVOKED},
+            pairing_error=None,
+        )
 
     if isinstance(event, PairingFailedEvent):
         return replace(
@@ -579,10 +624,15 @@ def reduce(state: UiState, event: Event) -> UiState:
         last_success_label = state.last_success_label
         if event.succeeded > 0 and event.finished_at_label:
             last_success_label = event.finished_at_label
+        notices = state.notices
+        if event.succeeded > 0:
+            # A run that synced an account used a valid token.
+            notices = notices - {NOTICE_TOKEN_REVOKED}
         return replace(
             state,
             screen=screen,
             rows=dict(state.rows),
+            notices=notices,
             refresh_disabled=False,
             cancel_requested=False,
             last_success_label=last_success_label,
@@ -602,8 +652,8 @@ def reduce(state: UiState, event: Event) -> UiState:
         # Pinned notice, not a screen swap — see the event's own docstring for why.
         # `refresh_disabled=True` because retrying cannot succeed against a server
         # that refuses this build outright; the screen itself is left exactly as it
-        # was, matching the "notices only ever grow" convention every other pinned
-        # notice in this module already follows.
+        # was. Nothing ever clears this notice: no later run can prove it stale (see
+        # the "Pinned notices" table near the top of this module).
         return replace(
             state,
             rows=dict(state.rows),
@@ -654,7 +704,15 @@ def reduce(state: UiState, event: Event) -> UiState:
         stages[event.stage] = StageState(
             stage=event.stage, status=event.status, detail=detail, elapsed_seconds=elapsed
         )
-        return replace(state, stages=stages)
+        # Stale-notice clearing (quick 260925-qhs): a finished fetch proves the token
+        # valid; a found terminal proves «MetaTrader 5 не найден» stale.
+        notices = state.notices
+        if event.status == STAGE_DONE:
+            if event.stage == STAGE_FETCH_ACCOUNTS:
+                notices = notices - {NOTICE_TOKEN_REVOKED}
+            elif event.stage == STAGE_FIND_TERMINAL:
+                notices = notices - {NOTICE_NO_TERMINAL}
+        return replace(state, stages=stages, notices=notices)
 
     if isinstance(event, CancelRequestedEvent):
         if state.screen != SCREEN_RUNNING:

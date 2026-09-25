@@ -1,0 +1,104 @@
+# Installer smoke test — RUN THIS BY HAND BEFORE TAGGING (quick 260925-qhs).
+#
+# It proves packaging/installer/treedger.iss in about two minutes instead of a
+# ~38-minute release run: compile with ISCC, silent install into Program Files with the
+# autostart task selected, the HKCU Run value present with the exact command the
+# program itself writes, silent uninstall, the Run value gone, and %APPDATA%\TreedgerAgent
+# (per-user token/settings/logs) still there. No Nuitka build: the payload is a stub
+# Treedger.exe, because only the installer's own behaviour is under test here.
+#
+# Not provable here (the owner's CHECKLIST-RU Шаг 4 covers them): the SmartScreen and
+# UAC windows on a real desktop, the finish-page launch running non-elevated, and the
+# real program's autostart at logon.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Compile + silent install/uninstall (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Locate ISCC (pinned Chocolatey fallback)
+        id: iscc
+        shell: pwsh
+        run: |
+          function Find-Iscc {
+            @(
+              (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+              (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            Write-Host "ISCC.exe not preinstalled - installing Inno Setup 6.7.1 (pinned) from Chocolatey"
+            choco install innosetup --version 6.7.1 -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install innosetup 6.7.1 failed with exit code $LASTEXITCODE" }
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw "ISCC.exe (Inno Setup 6) not found" }
+          Write-Host "ISCC: $iscc"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "path=$iscc"
+
+      - name: Compile the installer around a stub payload
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "smoke_payload" -Force | Out-Null
+          Set-Content -Path "smoke_payload/Treedger.exe" -Value "stub payload - not a real program" -Encoding ascii
+          $sourceDir = (Resolve-Path "smoke_payload").Path
+          $outDir = Join-Path (Get-Location).Path "smoke_output"
+          & "${{ steps.iscc.outputs.path }}" "/DAppVersion=0.0.0-smoke" "/DSourceDir=$sourceDir" "/O$outDir" "/Ftreedger-smoke-setup" "packaging/installer/treedger.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path (Join-Path $outDir "treedger-smoke-setup.exe"))) { throw "installer was not produced" }
+
+      - name: Silent install with the autostart task, then assert files + Run value
+        shell: pwsh
+        run: |
+          $setup = Join-Path (Get-Location).Path "smoke_output/treedger-smoke-setup.exe"
+          $log = Join-Path (Get-Location).Path "install.log"
+          $proc = Start-Process -FilePath $setup -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /TASKS=`"autostart`" /LOG=`"$log`"" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "installer exit code $($proc.ExitCode)" }
+          $exe = Join-Path $env:ProgramFiles "Treedger\Treedger.exe"
+          if (-not (Test-Path $exe)) { throw "not installed: $exe" }
+          $expected = "`"$exe`" --minimized"
+          $actual = (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "TreedgerAgent" -ErrorAction Stop).TreedgerAgent
+          if ($actual -ne $expected) { throw "Run value mismatch: expected [$expected] got [$actual]" }
+          Write-Host "Run value OK: $actual"
+
+      - name: Silent uninstall, then assert Run value gone and %APPDATA% data kept
+        shell: pwsh
+        run: |
+          $appData = Join-Path $env:APPDATA "TreedgerAgent"
+          New-Item -ItemType Directory -Path $appData -Force | Out-Null
+          $marker = Join-Path $appData "smoke-marker.txt"
+          Set-Content -Path $marker -Value "must survive uninstall" -Encoding ascii
+          $exe = Join-Path $env:ProgramFiles "Treedger\Treedger.exe"
+          $uninstaller = Join-Path $env:ProgramFiles "Treedger\unins000.exe"
+          if (-not (Test-Path $uninstaller)) { throw "uninstaller missing: $uninstaller" }
+          $log = Join-Path (Get-Location).Path "uninstall.log"
+          Start-Process -FilePath $uninstaller -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /LOG=`"$log`"" -Wait
+          # The uninstaller relaunches itself from %TEMP% and the first process returns
+          # at once — poll until the program file is really gone.
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Test-Path $exe) -and ((Get-Date) -lt $deadline)) { Start-Sleep -Seconds 1 }
+          if (Test-Path $exe) { throw "uninstall did not remove $exe within 60 s" }
+          $left = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "TreedgerAgent" -ErrorAction SilentlyContinue
+          if ($null -ne $left) { throw "Run value still present after uninstall: $($left.TreedgerAgent)" }
+          if (-not (Test-Path $marker)) { throw "%APPDATA%\TreedgerAgent was removed - per-user data must be kept" }
+          Write-Host "Uninstall OK: files and Run value gone, %APPDATA%\TreedgerAgent kept"
+
+      - name: Upload installer logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-smoke-logs
+          path: |
+            install.log
+            uninstall.log
+          if-no-files-found: ignore

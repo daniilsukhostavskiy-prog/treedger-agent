@@ -20,6 +20,16 @@ flipping a row's `source` from ASSUMPTION to CONFIRMED_IN_PRACTICE and, if the
 probe's findings disagree with the guess recorded here, correcting that row's
 `category`. No consumer of this module may hardcode an MT5 error code of its own.
 
+First real-terminal evidence (2026-09-25, quick 260925-qhs): the owner ran the
+packaged v0.2.0 program against a real MetaTrader 5 terminal and a real FTMO account
+on their own machine. Three rows changed on that evidence, and only those three: -10005
+gained the observation that «Алготрейдинг» OFF blocks the IPC connection itself (and
+the `suggests_algotrading_off_at_connect` flag), -6 moved from ASSUMPTION to
+CONFIRMED_IN_PRACTICE (it arrived from a broken terminal install, a non-credential
+cause), and -10006 records that it was NOT observed. R-01 — whether any code separates
+a broker-closed account from a wrong password — is still open: -6 now has positive
+evidence that one code covers several unrelated causes.
+
 THE LOAD-BEARING INVARIANT
 ---------------------------
 `ErrorCategory` has NO `broker_closed` member. Not "we avoid mapping to it" — it does
@@ -95,6 +105,11 @@ class ErrorCodeInfo:
     category: ErrorCategory
     source: ErrorSource
     note: str
+    # Marks a code that, when `mt5.initialize()` ITSELF fails with it, most often means
+    # «Алготрейдинг» (Algo Trading) is switched off in the terminal. A HINT for the
+    # user-facing message only — never a category change and never a lifecycle
+    # verdict: the same code can also come from, e.g., a slow cold start.
+    suggests_algotrading_off_at_connect: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -143,18 +158,20 @@ MT5_ERROR_CODES: dict[int, ErrorCodeInfo] = {
     ),
     -6: ErrorCodeInfo(
         category=ErrorCategory.CONNECTION_ERROR,
-        source=ErrorSource.ASSUMPTION,
+        source=ErrorSource.CONFIRMED_IN_PRACTICE,
         note=(
-            "CONTESTED — the single highest-priority row for the second "
-            "developer's probe. The donor's production classifier names this "
-            "IPC_FAILED (terminal-to-broker connection lost, connection-class) and "
-            "has observed it live, but the official MQL5 docs page for "
-            "last_error() names the SAME code RES_E_AUTH_FAILED — the OPPOSITE "
-            "meaning. Resolved toward CONNECTION_ERROR "
-            "here because the asymmetry rule above requires an ambiguous code to "
-            "fall on the recoverable side: CONNECTION_ERROR can never feed the "
-            "broker_closed heuristic, while AUTH_FAILED can. This is a deliberate "
-            "choice under genuine uncertainty, not a confirmed fact."
+            "Observed live 2026-09-25 (v0.2.0, the owner's machine) as "
+            "(-6, 'Terminal: Authorization failed') in 0.0 s, right after "
+            "«Алготрейдинг» was enabled. The cause was a BROKEN TERMINAL INSTALL: a "
+            "plain MetaQuotes build that could not reach FTMO-Server4 — zero "
+            "traffic, not one line in the terminal's own journal; after reinstalling "
+            "MT5 the same credentials worked first time. So -6 arrives for a "
+            "non-credential cause, and the recoverable CONNECTION_ERROR side chosen "
+            "here (the donor calls it IPC_FAILED) is confirmed right. The official "
+            "MQL5 docs still name this code RES_E_AUTH_FAILED, so a broker-closed "
+            "account, a wrong password and a broken install remain indistinguishable "
+            "by code — R-01 is unresolved, now with positive evidence, and the "
+            "never-automate-broker_closed rule (D-29..D-36) stands."
         ),
     ),
     -10001: ErrorCodeInfo(
@@ -168,10 +185,16 @@ MT5_ERROR_CODES: dict[int, ErrorCodeInfo] = {
     -10005: ErrorCodeInfo(
         category=ErrorCategory.CONNECTION_ERROR,
         source=ErrorSource.CONFIRMED_IN_PRACTICE,
+        suggests_algotrading_off_at_connect=True,
         note=(
             "Observed live in the donor's own incident history (DEPLOY.md's "
             "'Known Issue: IPC timeout' section, 2026-08-01) as an IPC timeout — "
-            "connection-class and recoverable on retry, not a credential problem."
+            "connection-class and recoverable on retry, not a credential problem. "
+            "Observed live again 2026-09-25 on the owner's machine with v0.2.0: with "
+            "«Алготрейдинг» OFF, mt5.initialize() returned (-10005, 'IPC timeout') "
+            "after 20 s (attempt A) and 88 s (attempt B). Algo-trading OFF blocks the "
+            "IPC connection itself, not only history reads (Phase 39 §12.1 settled); "
+            "-10006 was NOT observed. Hence the connect hint flag on this row."
         ),
     ),
     -10006: ErrorCodeInfo(
@@ -187,7 +210,9 @@ MT5_ERROR_CODES: dict[int, ErrorCodeInfo] = {
             "ALGOTRADING_DISABLED per this program's own decision to give "
             "AUTO_TRADING_DISABLED its own branch; this row is an "
             "honest assumption, not a confirmed fact, pending the second "
-            "developer's probe run once with algo-trading off and once with it on."
+            "developer's probe run once with algo-trading off and once with it on. "
+            "Not observed in the 2026-09-25 live run — algo-trading OFF produced "
+            "-10005 instead."
         ),
     ),
     -8: ErrorCodeInfo(

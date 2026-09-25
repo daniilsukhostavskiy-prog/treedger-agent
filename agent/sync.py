@@ -132,6 +132,11 @@ class AccountProgress:
     # str}` when a session was ALREADY active in the terminal at startup, or
     # `None` when it was not. The GUI pins its persistent notice off this field.
     pre_existing_session: Optional[dict] = None
+    # Set only on the one PHASE_TERMINAL_CHECK event: `terminal_info().trade_allowed`
+    # read right after a successful connect — False means «Алготрейдинг» is off (the
+    # GUI pins an instruction), True clears that instruction, None = unknown.
+    # Kept LAST so every positional construction elsewhere stays valid.
+    algo_trading_allowed: Optional[bool] = None
 
 
 @dataclass
@@ -192,6 +197,22 @@ class SyncAbortedError(Exception):
     catches). This is the DISTINCT "a path was found but the terminal itself refused
     to start" case.
     """
+
+
+class AlgoTradingSuspectedError(SyncAbortedError):
+    """
+    The terminal could not be connected to and the failing attempt's MT5 error code is
+    one of `mt5_bridge.ALGOTRADING_CONNECT_HINT_CODES` (-10005 was observed live with
+    «Алготрейдинг» off, 2026-09-25). This is a HINT that drives a more specific
+    message in the window — the same code can also come from, e.g., a slow cold start
+    — never a lifecycle verdict about any account. A subclass of `SyncAbortedError`,
+    so a caller that only knows the parent still treats it as "no terminal
+    connection this run".
+    """
+
+    def __init__(self, message: str, *, error_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class TerminalLaunchError(SyncAbortedError):
@@ -562,6 +583,7 @@ def run_sync(
     _log_running_terminals(running, path, self_elevated)
 
     # --- launch (only when verifiably none is running) ----------------------
+    launched_by_this_run = False
     if running == []:
         _stage(STAGE_LAUNCH_TERMINAL, STAGE_IN_PROGRESS)
         try:
@@ -571,6 +593,7 @@ def run_sync(
             _stage(STAGE_LAUNCH_TERMINAL, STAGE_FAILED)
             raise TerminalLaunchError("MetaTrader 5 could not be started") from exc
         logger.info("run_sync: no terminal64.exe was running; started pid=%d minimized", pid)
+        launched_by_this_run = True
         _stage(STAGE_LAUNCH_TERMINAL, STAGE_DONE, detail="запущен свёрнутым")
         _check_cancel("starting the terminal")
 
@@ -581,11 +604,21 @@ def run_sync(
         def on_tick(seconds: int) -> None:
             report_stage(StageProgress(STAGE_CONNECT, STAGE_IN_PROGRESS, elapsed_seconds=seconds))
 
+    # A terminal this run just started is a COLD start (at logon it competes with every
+    # other startup app), so it gets the longer whole-connect budget; an
+    # already-running terminal keeps the default one (quick 260925-qhs).
+    connect_kwargs: "dict[str, Any]" = {}
+    if on_tick is not None:
+        connect_kwargs["on_tick"] = on_tick
+    if launched_by_this_run:
+        connect_kwargs["budget_seconds"] = mt5_bridge.COLD_START_CONNECT_BUDGET_SECONDS
+        logger.info(
+            "run_sync: this run started the terminal — cold-start connect budget %.0f s",
+            mt5_bridge.COLD_START_CONNECT_BUDGET_SECONDS,
+        )
+
     try:
-        if on_tick is not None:
-            initialized = mt5_bridge.initialize_terminal(path, on_tick=on_tick)
-        else:
-            initialized = mt5_bridge.initialize_terminal(path)
+        initialized = mt5_bridge.initialize_terminal(path, **connect_kwargs)
     except mt5_bridge.TerminalUnresponsiveError as exc:
         exc.elevation_mismatch = self_elevated is False and any(
             t.elevated is True for t in (running or [])
@@ -602,8 +635,24 @@ def run_sync(
         raise
     if not initialized:
         _stage(STAGE_CONNECT, STAGE_FAILED)
+        error_code = mt5_bridge.last_connect_error_code()
+        logger.error("run_sync: terminal failed to initialize, last connect error code=%s", error_code)
+        if error_code is not None and error_code in mt5_bridge.ALGOTRADING_CONNECT_HINT_CODES:
+            raise AlgoTradingSuspectedError(
+                f"MetaTrader 5 terminal failed to initialize (code {error_code}); "
+                "«Алготрейдинг» is probably off",
+                error_code=error_code,
+            )
         raise SyncAbortedError("MetaTrader 5 terminal failed to initialize")
     _stage(STAGE_CONNECT, STAGE_DONE)
+
+    # «Алготрейдинг» state, read once right after the connect. False never aborts the
+    # run — the connection is up; the window pins an instruction instead.
+    algo_trading_allowed = mt5_bridge.terminal_trade_allowed()
+    if algo_trading_allowed is False:
+        logger.warning("run_sync: terminal reports trade_allowed=False («Алготрейдинг» is off)")
+    else:
+        logger.info("run_sync: terminal trade_allowed=%s", algo_trading_allowed)
     _check_cancel("connecting to the terminal")
 
     # Read whatever account is ALREADY logged in, before this program logs
@@ -616,6 +665,7 @@ def run_sync(
             mt_login=None,
             phase=PHASE_TERMINAL_CHECK,
             pre_existing_session=pre_existing_session,
+            algo_trading_allowed=algo_trading_allowed,
         )
     )
 

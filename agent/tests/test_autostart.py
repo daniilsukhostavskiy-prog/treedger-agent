@@ -1,93 +1,121 @@
 """
-agent/tests/test_autostart.py — behavioural and structural tests for agent/autostart.py.
+agent/tests/test_autostart.py — behavioural and structural tests for agent/autostart.py,
+the per-user HKCU Run-value autostart (quick 260925-qhs, replacing the Task Scheduler
+entry whose any-user ONLOGON trigger failed with "Access is denied").
 
-`subprocess.run` is monkeypatched module-wide to a recorder that captures each
-invocation's argument LIST (never a rendered string) and returns canned scheduler
-output. Structural claims (parameter-less
-signatures, no `shell=True`) are decided by `ast`, matching this project's
-established grep-is-not-proof convention: a text search finds the words used to
-describe a prohibition, not what the code actually does.
+The real registry is NEVER touched: conftest.py's autouse guard replaces
+`autostart._winreg` with an object that fails the test on any access, and every test
+here that needs a registry swaps in `_FakeWinreg`, an in-memory stand-in with the same
+small API surface autostart.py uses. Structural claims (parameter-less signatures, no
+subprocess import) are decided by `ast`, never by a text search.
 """
 from __future__ import annotations
 
 import ast
 import pathlib
 import sys
-import types
+from typing import Any, Optional
 
 import pytest
 
 from agent import autostart
 
+_OWN_EXE = r"C:\Program Files\Treedger\Treedger.exe"
+_OWN_COMMAND = f'"{_OWN_EXE}" --minimized'
 
-class _RunRecorder:
-    """
-    A stand-in for `subprocess.run`, injected via monkeypatch. Captures every
-    invocation's argument list (asserting it IS a list, never a shell string) AND its
-    keyword arguments, and returns either a caller-supplied canned response or a
-    generic success response.
-    """
+
+class _FakeKey:
+    def __init__(self, registry: "_FakeWinreg", path: str, access: int) -> None:
+        self.registry = registry
+        self.path = path
+        self.access = access
+
+    def __enter__(self) -> "_FakeKey":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+
+class _FakeWinreg:
+    """In-memory HKCU: {key_path: {value_name: (value, type)}}. The Run key always
+    exists; StartupApproved\\Run exists only when a test creates it."""
+
+    HKEY_CURRENT_USER = object()
+    KEY_READ = 0x20019
+    KEY_SET_VALUE = 0x0002
+    REG_SZ = 1
+    REG_BINARY = 3
 
     def __init__(self) -> None:
-        self.calls: "list[list[str]]" = []
-        self.kwargs: "list[dict[str, object]]" = []
-        self._queued_responses: "list[types.SimpleNamespace]" = []
+        self.keys: "dict[str, dict[str, tuple[Any, int]]]" = {autostart.RUN_KEY_PATH: {}}
+        self.writes: "list[tuple[str, str, int, Any]]" = []
+        self.deletes: "list[tuple[str, str]]" = []
+        self.opened: "list[tuple[str, int]]" = []
+        self.fail_writes = False
 
-    def queue_response(self, response: types.SimpleNamespace) -> None:
-        self._queued_responses.append(response)
+    # ---- test helpers ----------------------------------------------------
+    def set_run(self, value: Any, value_type: int = REG_SZ) -> None:
+        self.keys[autostart.RUN_KEY_PATH][autostart.RUN_VALUE_NAME] = (value, value_type)
 
-    def __call__(self, args: object, **kwargs: object) -> types.SimpleNamespace:
-        assert isinstance(args, list), "subprocess.run must be called with an argument list"
-        assert "shell" not in kwargs, "subprocess.run must never be called with shell="
-        self.calls.append(list(args))  # type: ignore[arg-type]
-        self.kwargs.append(dict(kwargs))
-        if self._queued_responses:
-            return self._queued_responses.pop(0)
-        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+    def set_approved(self, value: Any) -> None:
+        self.keys.setdefault(autostart.STARTUP_APPROVED_KEY_PATH, {})[autostart.RUN_VALUE_NAME] = (
+            value,
+            self.REG_BINARY,
+        )
+
+    def run_value(self) -> Optional[Any]:
+        entry = self.keys[autostart.RUN_KEY_PATH].get(autostart.RUN_VALUE_NAME)
+        return None if entry is None else entry[0]
+
+    def approved_present(self) -> bool:
+        return autostart.RUN_VALUE_NAME in self.keys.get(autostart.STARTUP_APPROVED_KEY_PATH, {})
+
+    # ---- the winreg API autostart.py uses --------------------------------
+    def OpenKeyEx(self, root: object, path: str, reserved: int = 0, access: int = KEY_READ) -> _FakeKey:  # noqa: N802
+        assert root is self.HKEY_CURRENT_USER, "only HKCU may ever be opened"
+        self.opened.append((path, access))
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        return _FakeKey(self, path, access)
+
+    def QueryValueEx(self, key: _FakeKey, name: str) -> "tuple[Any, int]":  # noqa: N802
+        values = self.keys[key.path]
+        if name not in values:
+            raise FileNotFoundError(name)
+        return values[name]
+
+    def SetValueEx(self, key: _FakeKey, name: str, reserved: int, value_type: int, value: Any) -> None:  # noqa: N802
+        assert key.access & self.KEY_SET_VALUE, "a write needs KEY_SET_VALUE access"
+        if self.fail_writes:
+            raise PermissionError("denied")
+        self.writes.append((key.path, name, value_type, value))
+        self.keys[key.path][name] = (value, value_type)
+
+    def DeleteValue(self, key: _FakeKey, name: str) -> None:  # noqa: N802
+        assert key.access & self.KEY_SET_VALUE, "a delete needs KEY_SET_VALUE access"
+        values = self.keys[key.path]
+        if name not in values:
+            raise FileNotFoundError(name)
+        self.deletes.append((key.path, name))
+        del values[name]
 
 
-def _task_xml(command: str, arguments: str = autostart.MINIMIZED_FLAG) -> str:
-    """The shape `schtasks /Query /TN ... /XML` really prints: a UTF-16 declaration
-    over single-byte text, `\\r\\r\\n` line endings, the task namespace, and a quoted
-    Command (Task Scheduler stores the /TR quotes)."""
-    args_line = f"      <Arguments>{arguments}</Arguments>\r\r\n" if arguments else ""
-    return (
-        '<?xml version="1.0" encoding="UTF-16"?>\r\r\n'
-        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\r\r\n'
-        "  <Actions Context=\"Author\">\r\r\n"
-        "    <Exec>\r\r\n"
-        f"      <Command>\"{command}\"</Command>\r\r\n"
-        f"{args_line}"
-        "    </Exec>\r\r\n"
-        "  </Actions>\r\r\n"
-        "</Task>\r\r\n"
-    )
-
-
-def _query_success_response(command: str, arguments: str = autostart.MINIMIZED_FLAG) -> types.SimpleNamespace:
-    """A canned `schtasks /Query ... /XML` success response (ASCII-safe bytes)."""
-    return types.SimpleNamespace(
-        returncode=0, stdout=_task_xml(command, arguments).encode("ascii"), stderr=b""
-    )
-
-
-def _query_not_found_response() -> types.SimpleNamespace:
-    """A canned `schtasks /Query` failure response — the task does not exist. The
-    stderr text is localized in real life, which is why only the returncode counts."""
-    return types.SimpleNamespace(
-        returncode=1,
-        stdout=b"",
-        stderr="ОШИБКА: Не удается найти указанный файл.\r\n".encode("cp866"),
-    )
+@pytest.fixture()
+def reg(monkeypatch: pytest.MonkeyPatch) -> _FakeWinreg:
+    fake = _FakeWinreg()
+    monkeypatch.setattr(autostart, "_winreg", fake)
+    monkeypatch.setattr(autostart, "own_executable_path", lambda: _OWN_EXE)
+    return fake
 
 
 # ---------------------------------------------------------------------------
-# own_executable_path()
+# own_executable_path() — unchanged
 # ---------------------------------------------------------------------------
 
 
 def test_own_executable_path_returns_frozen_executable(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_exe = r"C:\Users\someone\AppData\Local\Programs\Treedger\Treedger.exe"
+    fake_exe = r"C:\Program Files\Treedger\Treedger.exe"
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", fake_exe)
 
@@ -104,309 +132,222 @@ def test_own_executable_path_falls_back_to_argv0_when_not_frozen(
     assert autostart.own_executable_path() == autostart.os.path.realpath(fake_argv0)
 
 
-# ---------------------------------------------------------------------------
-# query_task_command() / task_exists()
-# ---------------------------------------------------------------------------
-
-
-def test_query_task_command_returns_registered_command(monkeypatch: pytest.MonkeyPatch) -> None:
-    recorder = _RunRecorder()
-    recorder.queue_response(_query_success_response(r"C:\path\Treedger\Treedger.exe"))
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-
-    assert autostart.query_task_command() == r'"C:\path\Treedger\Treedger.exe" --minimized'
-
-
-def test_query_task_command_returns_none_when_no_task(monkeypatch: pytest.MonkeyPatch) -> None:
-    recorder = _RunRecorder()
-    recorder.queue_response(_query_not_found_response())
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-
-    assert autostart.query_task_command() is None
-
-
-def test_task_exists_true_and_false(monkeypatch: pytest.MonkeyPatch) -> None:
-    recorder = _RunRecorder()
-    recorder.queue_response(_query_success_response(r"C:\path\Treedger\Treedger.exe"))
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-    assert autostart.task_exists() is True
-
-    recorder2 = _RunRecorder()
-    recorder2.queue_response(_query_not_found_response())
-    monkeypatch.setattr(autostart.subprocess, "run", recorder2)
-    assert autostart.task_exists() is False
+def test_build_command_line_quotes_the_path_and_appends_the_flag() -> None:
+    assert autostart._build_command_line(_OWN_EXE) == _OWN_COMMAND
 
 
 # ---------------------------------------------------------------------------
-# repair_task_path()
+# Reading
 # ---------------------------------------------------------------------------
 
 
-def test_repair_issues_no_command_when_no_task_exists(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    The never-create case: `query_task_command()` (the only primitive that could reach
-    `subprocess.run`) is bypassed directly so the recorder can prove the true claim —
-    `repair_task_path()` issues NOTHING AT ALL, not even a query, once it has already
-    learned no task exists.
-    """
-    monkeypatch.setattr(autostart, "query_task_command", lambda: None)
-    recorder = _RunRecorder()
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-
-    result = autostart.repair_task_path()
-
-    assert recorder.calls == []
-    assert "no" in result.lower()
+def test_registered_command_reads_the_run_value(reg: _FakeWinreg) -> None:
+    assert autostart.registered_command() is None
+    reg.set_run(_OWN_COMMAND)
+    assert autostart.registered_command() == _OWN_COMMAND
 
 
-def test_repair_issues_no_change_when_path_already_correct(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_exe = r"C:\Users\someone\AppData\Local\Programs\Treedger\Treedger.exe"
-    monkeypatch.setattr(autostart, "own_executable_path", lambda: fake_exe)
-    current_command = f'"{fake_exe}" {autostart.MINIMIZED_FLAG}'
-    monkeypatch.setattr(autostart, "query_task_command", lambda: current_command)
-    recorder = _RunRecorder()
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-
-    result = autostart.repair_task_path()
-
-    assert recorder.calls == []
-    assert "already correct" in result.lower()
+def test_registered_command_ignores_a_non_string_value(reg: _FakeWinreg) -> None:
+    reg.set_run(b"\x01\x02", _FakeWinreg.REG_BINARY)
+    assert autostart.registered_command() is None
 
 
-def test_repair_issues_exactly_one_change_when_path_differs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_exe = r"C:\Users\someone\AppData\Local\Programs\Treedger\Treedger.exe"
-    monkeypatch.setattr(autostart, "own_executable_path", lambda: fake_exe)
-    stale_command = r'"D:\old\location\Treedger\Treedger.exe" --minimized'
-    monkeypatch.setattr(autostart, "query_task_command", lambda: stale_command)
-    recorder = _RunRecorder()
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-
-    result = autostart.repair_task_path()
-
-    assert len(recorder.calls) == 1
-    call = recorder.calls[0]
-    assert call[0] == "schtasks"
-    assert "/Change" in call
-    assert autostart.TASK_NAME in call
-    tr_index = call.index("/TR") + 1
-    assert fake_exe in call[tr_index]
-    assert autostart.MINIMIZED_FLAG in call[tr_index]
-    assert "repaired" in result.lower()
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (_OWN_COMMAND, _OWN_EXE),
+        (r'"C:\x\y.exe"', r"C:\x\y.exe"),
+        (r"C:\x\y.exe --minimized", None),
+        ('"unterminated', None),
+        ("", None),
+    ],
+)
+def test_registered_exe_is_the_first_quoted_text(command: str, expected: Optional[str]) -> None:
+    assert autostart._registered_exe(command) == expected
 
 
-def test_repair_task_path_accepts_no_parameters() -> None:
-    with pytest.raises(TypeError):
-        autostart.repair_task_path(object())  # type: ignore[call-arg]
+def test_enabled_only_for_this_exe_and_not_disabled_in_task_manager(reg: _FakeWinreg) -> None:
+    assert autostart.autostart_enabled_for_this_exe() is False  # no value
+
+    reg.set_run(_OWN_COMMAND)
+    assert autostart.autostart_enabled_for_this_exe() is True  # no StartupApproved key
+
+    reg.set_run(_OWN_COMMAND.upper())
+    assert autostart.autostart_enabled_for_this_exe() is True  # case-insensitive
+
+    reg.set_approved(bytes([0x02]) + bytes(11))
+    assert autostart.autostart_enabled_for_this_exe() is True  # even first byte = enabled
+
+    reg.set_approved(bytes([0x03]) + bytes(11))
+    assert autostart.disabled_in_startup_apps() is True
+    assert autostart.autostart_enabled_for_this_exe() is False  # odd = disabled in Task Manager
 
 
-# ---------------------------------------------------------------------------
-# create_task()
-# ---------------------------------------------------------------------------
+def test_a_different_exe_reads_as_not_enabled(reg: _FakeWinreg) -> None:
+    reg.set_run(r'"D:\portable\Treedger\Treedger.exe" --minimized')
+    assert autostart.autostart_enabled_for_this_exe() is False
 
 
-def test_create_task_issues_exactly_one_create_invocation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_exe = r"C:\Users\someone\AppData\Local\Programs\Treedger\Treedger.exe"
-    monkeypatch.setattr(autostart, "own_executable_path", lambda: fake_exe)
-    recorder = _RunRecorder()
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-
-    autostart.create_task()
-
-    assert len(recorder.calls) == 1
-    call = recorder.calls[0]
-    assert call[0] == "schtasks"
-    assert "/Create" in call
-    assert autostart.TASK_NAME in call
-    tr_index = call.index("/TR") + 1
-    assert fake_exe in call[tr_index]
-    assert autostart.MINIMIZED_FLAG in call[tr_index]
+def test_disabled_in_startup_apps_ignores_non_bytes_and_empty(reg: _FakeWinreg) -> None:
+    assert autostart.disabled_in_startup_apps() is False  # key absent
+    reg.set_approved("03")
+    assert autostart.disabled_in_startup_apps() is False
+    reg.set_approved(b"")
+    assert autostart.disabled_in_startup_apps() is False
 
 
-def test_create_task_accepts_no_parameters() -> None:
-    with pytest.raises(TypeError):
-        autostart.create_task(object())  # type: ignore[call-arg]
+def test_winreg_unavailable_reads_as_not_enabled_and_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(autostart, "_winreg", None)
+    assert autostart.registered_command() is None
+    assert autostart.autostart_enabled_for_this_exe() is False
+    assert autostart.disabled_in_startup_apps() is False
+    assert isinstance(autostart.repair_autostart_path(), str)
+    autostart.enable_autostart()
+    autostart.disable_autostart()
 
 
 # ---------------------------------------------------------------------------
-# remove_task()
+# enable / disable
 # ---------------------------------------------------------------------------
 
 
-def test_remove_task_issues_exactly_one_delete_invocation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    recorder = _RunRecorder()
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
+def test_enable_writes_exactly_once_and_clears_the_task_manager_marker(reg: _FakeWinreg) -> None:
+    reg.set_approved(bytes([0x03]) + bytes(11))
 
-    autostart.remove_task()
+    autostart.enable_autostart()
 
-    assert len(recorder.calls) == 1
-    call = recorder.calls[0]
-    assert call[0] == "schtasks"
-    assert "/Delete" in call
-    assert autostart.TASK_NAME in call
+    assert reg.writes == [(autostart.RUN_KEY_PATH, "TreedgerAgent", _FakeWinreg.REG_SZ, _OWN_COMMAND)]
+    assert not reg.approved_present()
+    assert autostart.autostart_enabled_for_this_exe() is True
+
+
+def test_enable_without_a_marker_still_writes_exactly_once(reg: _FakeWinreg) -> None:
+    autostart.enable_autostart()
+    assert len(reg.writes) == 1
+    assert reg.run_value() == _OWN_COMMAND
+
+
+def test_enable_never_raises_on_a_registry_error(reg: _FakeWinreg) -> None:
+    reg.fail_writes = True
+    autostart.enable_autostart()
+    assert reg.run_value() is None
+
+
+def test_disable_deletes_both_values(reg: _FakeWinreg) -> None:
+    reg.set_run(_OWN_COMMAND)
+    reg.set_approved(bytes([0x03]) + bytes(11))
+
+    autostart.disable_autostart()
+
+    assert reg.run_value() is None
+    assert not reg.approved_present()
+    assert reg.writes == []
+
+
+def test_disable_tolerates_absent_values(reg: _FakeWinreg) -> None:
+    autostart.disable_autostart()  # neither value, StartupApproved key missing
+    assert reg.deletes == []
 
 
 # ---------------------------------------------------------------------------
-# Structural: signatures and no shell=True (also re-asserted by the plan's own
-# verify command against the real source file — these tests give a readable failure
-# inside the normal pytest run too).
+# repair_autostart_path() — never creates; rewrites only a dead path
 # ---------------------------------------------------------------------------
 
 
-def test_structural_functions_exist_and_writer_functions_are_parameterless() -> None:
-    source_path = pathlib.Path(__file__).resolve().parent.parent / "autostart.py"
-    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+def test_repair_writes_nothing_when_no_value_exists(reg: _FakeWinreg) -> None:
+    status = autostart.repair_autostart_path()
+    assert reg.writes == []
+    assert reg.run_value() is None
+    assert isinstance(status, str) and status
 
-    for name in (
-        "own_executable_path",
-        "task_exists",
-        "query_task_command",
-        "repair_task_path",
-        "create_task",
-        "remove_task",
-    ):
-        assert name in functions, f"missing {name}"
 
-    for name in ("create_task", "repair_task_path"):
+def test_repair_writes_nothing_when_already_correct(reg: _FakeWinreg) -> None:
+    reg.set_run(_OWN_COMMAND)
+    autostart.repair_autostart_path()
+    assert reg.writes == []
+
+
+def test_repair_rewrites_a_value_whose_exe_no_longer_exists(reg: _FakeWinreg, tmp_path: pathlib.Path) -> None:
+    gone = tmp_path / "moved-away" / "Treedger.exe"
+    reg.set_run(f'"{gone}" --minimized')
+
+    status = autostart.repair_autostart_path()
+
+    assert reg.writes == [(autostart.RUN_KEY_PATH, "TreedgerAgent", _FakeWinreg.REG_SZ, _OWN_COMMAND)]
+    assert "repaired" in status
+
+
+def test_repair_never_repoints_another_existing_copy(reg: _FakeWinreg, tmp_path: pathlib.Path) -> None:
+    other = tmp_path / "Treedger.exe"
+    other.write_bytes(b"MZ")
+    reg.set_run(f'"{other}" --minimized')
+
+    autostart.repair_autostart_path()
+
+    assert reg.writes == []
+    assert reg.run_value() == f'"{other}" --minimized'
+
+
+@pytest.mark.parametrize("value", [r"C:\no\quotes\Treedger.exe --minimized", '"', "garbage"])
+def test_repair_leaves_an_unparsable_value_alone(reg: _FakeWinreg, value: str) -> None:
+    reg.set_run(value)
+    autostart.repair_autostart_path()
+    assert reg.writes == []
+
+
+def test_repair_never_raises_on_a_registry_error(reg: _FakeWinreg, tmp_path: pathlib.Path) -> None:
+    reg.set_run(f'"{tmp_path / "gone.exe"}" --minimized')
+    reg.fail_writes = True
+    assert isinstance(autostart.repair_autostart_path(), str)
+
+
+# ---------------------------------------------------------------------------
+# Structural (ast)
+# ---------------------------------------------------------------------------
+
+
+def _autostart_tree() -> ast.Module:
+    return ast.parse(pathlib.Path(autostart.__file__).read_text(encoding="utf-8"))
+
+
+def test_writer_functions_take_no_parameters() -> None:
+    tree = _autostart_tree()
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    for name in ("enable_autostart", "disable_autostart", "repair_autostart_path", "_write_own_command"):
+        assert name in functions, f"{name} missing"
         args = functions[name].args
-        assert not (
-            args.args or args.posonlyargs or args.kwonlyargs or args.vararg or args.kwarg
-        ), f"{name} must take no parameters"
+        total = len(args.posonlyargs) + len(args.args) + len(args.kwonlyargs)
+        assert total == 0 and args.vararg is None and args.kwarg is None, (
+            f"{name} must take no parameters — only this process's own path is ever written"
+        )
 
 
-def test_structural_no_shell_true_anywhere() -> None:
-    source_path = pathlib.Path(__file__).resolve().parent.parent / "autostart.py"
-    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    offenders = []
+def test_autostart_imports_no_subprocess() -> None:
+    tree = _autostart_tree()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            for kw in node.keywords:
-                if kw.arg == "shell":
-                    offenders.append(f"{source_path}:{node.lineno}")
-    assert not offenders, f"a subprocess call passes shell=: {offenders}"
+        if isinstance(node, ast.Import):
+            assert all(alias.name.split(".")[0] != "subprocess" for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert (node.module or "").split(".")[0] != "subprocess"
 
 
-# ---------------------------------------------------------------------------
-# 260925-k6y — locale-independent XML query, decoding, truthful checkbox,
-# CREATE_NO_WINDOW on every call.
-# ---------------------------------------------------------------------------
+def test_set_value_is_called_only_inside_write_own_command() -> None:
+    tree = _autostart_tree()
+    homes: "list[str]" = []
+    for function in [n for n in tree.body if isinstance(n, ast.FunctionDef)]:
+        for node in ast.walk(function):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "SetValueEx":
+                homes.append(function.name)
+    assert homes == ["_write_own_command"]
 
 
-def test_decode_utf16le_with_bom() -> None:
-    text = "<Task>Привет</Task>"
-    raw = b"\xff\xfe" + text.encode("utf-16-le")
-    assert autostart._decode_schtasks_output(raw) == text
-
-
-def test_decode_bytes_with_nuls_as_utf16le() -> None:
-    text = "<Command>C:\\x\\Treedger.exe</Command>"
-    assert autostart._decode_schtasks_output(text.encode("utf-16-le")) == text
-
-
-def test_decode_cp866_bytes_with_the_oem_codepage(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(autostart, "_oem_codepage", lambda: 866)
-    path = "C:\\Users\\Даниил\\Treedger\\Treedger.exe"
-    assert autostart._decode_schtasks_output(path.encode("cp866")) == path
-
-
-def test_decode_str_passes_through_and_none_is_empty() -> None:
-    assert autostart._decode_schtasks_output("already text") == "already text"
-    assert autostart._decode_schtasks_output(None) == ""
-
-
-def test_parse_task_xml_namespaced_with_declaration_and_crcrlf() -> None:
-    xml_text = _task_xml(r"C:\x y\Treedger.exe")
-    assert "\r\r\n" in xml_text and 'encoding="UTF-16"' in xml_text
-
-    assert autostart._parse_task_xml(xml_text) == (r"C:\x y\Treedger.exe", "--minimized")
-
-
-def test_parse_task_xml_without_exec_command_is_none() -> None:
-    xml_text = (
-        '<?xml version="1.0" encoding="UTF-16"?>\r\r\n'
-        '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
-        "<Actions><ComHandler><ClassId>{x}</ClassId></ComHandler></Actions></Task>"
-    )
-    assert autostart._parse_task_xml(xml_text) is None
-    assert autostart._parse_task_xml("not xml at all <") is None
-    assert autostart._parse_task_xml("") is None
-
-
-def test_query_task_command_from_canned_xml(monkeypatch: pytest.MonkeyPatch) -> None:
-    recorder = _RunRecorder()
-    recorder.queue_response(_query_success_response(r"C:\x y\Treedger.exe"))
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-
-    assert autostart.query_task_command() == r'"C:\x y\Treedger.exe" --minimized'
-    assert recorder.calls[0] == ["schtasks", "/Query", "/TN", autostart.TASK_NAME, "/XML"]
-
-
-def test_query_task_command_none_on_returncode_1(monkeypatch: pytest.MonkeyPatch) -> None:
-    recorder = _RunRecorder()
-    recorder.queue_response(_query_not_found_response())
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-    assert autostart.query_task_command() is None
-
-
-def test_query_task_command_without_arguments_omits_them(monkeypatch: pytest.MonkeyPatch) -> None:
-    recorder = _RunRecorder()
-    recorder.queue_response(_query_success_response(r"C:\x\Treedger.exe", arguments=""))
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-    assert autostart.query_task_command() == r'"C:\x\Treedger.exe"'
-
-
-def test_registered_for_this_exe_true_only_for_own_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    own = r"C:\Users\someone\Treedger\Treedger.exe"
-    monkeypatch.setattr(autostart, "own_executable_path", lambda: own)
-
-    monkeypatch.setattr(autostart, "query_task_command", lambda: f'"{own.upper()}" --MINIMIZED')
-    assert autostart.task_is_registered_for_this_exe() is True
-
-    monkeypatch.setattr(
-        autostart, "query_task_command", lambda: r'"D:\vps\main.exe" --minimized'
-    )
-    assert autostart.task_is_registered_for_this_exe() is False
-
-    monkeypatch.setattr(autostart, "query_task_command", lambda: None)
-    assert autostart.task_is_registered_for_this_exe() is False
-
-
-def test_repair_compares_case_insensitively(monkeypatch: pytest.MonkeyPatch) -> None:
-    own = r"C:\Users\someone\Treedger\Treedger.exe"
-    monkeypatch.setattr(autostart, "own_executable_path", lambda: own)
-    monkeypatch.setattr(autostart, "query_task_command", lambda: f'"{own.lower()}" --minimized')
-    recorder = _RunRecorder()
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-
-    assert "already correct" in autostart.repair_task_path()
-    assert recorder.calls == []
-
-
-def test_every_schtasks_call_carries_create_no_window(monkeypatch: pytest.MonkeyPatch) -> None:
-    own = r"C:\Users\someone\Treedger\Treedger.exe"
-    monkeypatch.setattr(autostart, "own_executable_path", lambda: own)
-    recorder = _RunRecorder()
-    recorder.queue_response(_query_success_response(r"D:\stale\Treedger.exe"))
-    monkeypatch.setattr(autostart.subprocess, "run", recorder)
-
-    autostart.repair_task_path()  # query + change
-    autostart.create_task()
-    autostart.remove_task()
-
-    verbs = [call[1] for call in recorder.calls]
-    assert verbs == ["/Query", "/Change", "/Create", "/Delete"]
-    for kwargs in recorder.kwargs:
-        assert kwargs.get("creationflags") == autostart._CREATE_NO_WINDOW
-        assert "shell" not in kwargs
-        assert kwargs.get("capture_output") is True
-        assert kwargs.get("check") is False
-    if sys.platform == "win32":
-        assert autostart._CREATE_NO_WINDOW == 0x08000000
+def test_only_hkcu_is_ever_referenced() -> None:
+    tree = _autostart_tree()
+    roots = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr.startswith("HKEY_")
+    }
+    assert roots == {"HKEY_CURRENT_USER"}

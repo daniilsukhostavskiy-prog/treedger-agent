@@ -80,8 +80,8 @@ def _make_bare_window(*, sync_in_flight: bool = False) -> "tuple[main.AgentWindo
 # "The periodic timer is scheduled with a delay equal to the sync-interval
 #  constant expressed in milliseconds — the first tick is an hour after
 #  launch, not at launch."
-# "Startup calls the scheduler path-repair function exactly once, and never
-#  the create function."
+# "Startup calls the autostart path-repair function exactly once, and never
+#  the enable function."
 # ---------------------------------------------------------------------------
 
 
@@ -95,10 +95,10 @@ def test_first_tick_scheduled_with_interval_delay_and_startup_repairs_once(
 
     repair_calls: "list[None]" = []
     monkeypatch.setattr(
-        autostart, "repair_task_path", lambda: repair_calls.append(None) or "repaired"
+        autostart, "repair_autostart_path", lambda: repair_calls.append(None) or "repaired"
     )
     create_calls: "list[None]" = []
-    monkeypatch.setattr(autostart, "create_task", lambda: create_calls.append(None))
+    monkeypatch.setattr(autostart, "enable_autostart", lambda: create_calls.append(None))
 
     fake_root = _FakeRoot()
     window = main.AgentWindow(fake_root)  # type: ignore[arg-type]
@@ -182,8 +182,8 @@ def test_periodic_tick_never_reads_autostart_state() -> None:
 
 
 # ---------------------------------------------------------------------------
-# "Toggling the autostart control on calls the create function exactly once;
-#  toggling it off calls the remove function exactly once."
+# "Toggling the autostart control on calls the enable function exactly once;
+#  toggling it off calls the disable function exactly once."
 # ---------------------------------------------------------------------------
 
 
@@ -198,15 +198,15 @@ class _FakeBooleanVar:
         self._value = value
 
 
-def test_autostart_toggle_on_calls_create_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_autostart_toggle_on_calls_enable_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
     window, _fake_root = _make_bare_window()
     window._autostart_var = _FakeBooleanVar(True)  # type: ignore[attr-defined]
 
     create_calls: "list[None]" = []
     remove_calls: "list[None]" = []
-    monkeypatch.setattr(autostart, "create_task", lambda: create_calls.append(None))
-    monkeypatch.setattr(autostart, "remove_task", lambda: remove_calls.append(None))
-    monkeypatch.setattr(autostart, "task_is_registered_for_this_exe", lambda: True)
+    monkeypatch.setattr(autostart, "enable_autostart", lambda: create_calls.append(None))
+    monkeypatch.setattr(autostart, "disable_autostart", lambda: remove_calls.append(None))
+    monkeypatch.setattr(autostart, "autostart_enabled_for_this_exe", lambda: True)
 
     window._on_autostart_toggled()
 
@@ -214,15 +214,15 @@ def test_autostart_toggle_on_calls_create_exactly_once(monkeypatch: pytest.Monke
     assert remove_calls == []
 
 
-def test_autostart_toggle_off_calls_remove_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_autostart_toggle_off_calls_disable_exactly_once(monkeypatch: pytest.MonkeyPatch) -> None:
     window, _fake_root = _make_bare_window()
     window._autostart_var = _FakeBooleanVar(False)  # type: ignore[attr-defined]
 
     create_calls: "list[None]" = []
     remove_calls: "list[None]" = []
-    monkeypatch.setattr(autostart, "create_task", lambda: create_calls.append(None))
-    monkeypatch.setattr(autostart, "remove_task", lambda: remove_calls.append(None))
-    monkeypatch.setattr(autostart, "task_is_registered_for_this_exe", lambda: False)
+    monkeypatch.setattr(autostart, "enable_autostart", lambda: create_calls.append(None))
+    monkeypatch.setattr(autostart, "disable_autostart", lambda: remove_calls.append(None))
+    monkeypatch.setattr(autostart, "autostart_enabled_for_this_exe", lambda: False)
 
     window._on_autostart_toggled()
 
@@ -448,13 +448,87 @@ def test_worker_cancelled_pushes_run_cancelled_then_one_sentinel(monkeypatch: py
     assert isinstance(events[1], main._SyncFinishedSentinel)
 
 
+# ---------------------------------------------------------------------------
+# quick 260925-qhs — one-shot startup sync, «Алготрейдинг» mapping
+# ---------------------------------------------------------------------------
+
+
+def test_init_schedules_exactly_one_startup_sync_and_one_periodic_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main.AgentWindow, "_build_widgets", lambda self: None)
+    monkeypatch.setattr(main.AgentWindow, "_render", lambda self: None)
+    monkeypatch.setattr(config_store, "load_token", lambda: None)
+    monkeypatch.setattr(terminal_discovery, "find_terminal_path", lambda: None)
+    monkeypatch.setattr(autostart, "repair_autostart_path", lambda: "no autostart value")
+
+    fake_root = _FakeRoot()
+    window = main.AgentWindow(fake_root)  # type: ignore[arg-type]
+
+    startup = [c for c in fake_root.after_calls if c[1] == window._on_startup_sync]
+    periodic = [c for c in fake_root.after_calls if c[1] == window._on_periodic_tick]
+    assert startup == [(constants.STARTUP_SYNC_DELAY_SECONDS * 1000, window._on_startup_sync)]
+    assert periodic == [(constants.SYNC_INTERVAL_SECONDS * 1000, window._on_periodic_tick)]
+    assert constants.STARTUP_SYNC_DELAY_SECONDS < constants.SYNC_INTERVAL_SECONDS
+
+
+def test_startup_sync_when_idle_refreshes_once_and_schedules_nothing() -> None:
+    window, fake_root = _make_bare_window(sync_in_flight=False)
+    refresh_calls: "list[None]" = []
+    window._on_refresh_clicked = lambda: refresh_calls.append(None)  # type: ignore[method-assign]
+
+    window._on_startup_sync()
+
+    assert refresh_calls == [None]
+    assert fake_root.after_calls == []
+
+
+def test_startup_sync_while_a_sync_is_in_flight_does_nothing() -> None:
+    window, fake_root = _make_bare_window(sync_in_flight=True)
+    refresh_calls: "list[None]" = []
+    window._on_refresh_clicked = lambda: refresh_calls.append(None)  # type: ignore[method-assign]
+
+    window._on_startup_sync()
+
+    assert refresh_calls == []
+    assert fake_root.after_calls == []
+
+
+def test_worker_maps_algo_trading_suspected_to_its_own_run_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = _run_worker_raising(monkeypatch, sync.AlgoTradingSuspectedError("ipc timeout", error_code=-10005))
+
+    assert len(events) == 2
+    assert isinstance(events[0], ui_state.RunFailedEvent)
+    assert events[0].kind == ui_state.RUN_ERROR_ALGO_TRADING
+    assert events[0].kind != ui_state.RUN_ERROR_TERMINAL_FAILED
+    assert isinstance(events[1], main._SyncFinishedSentinel)
+
+
+def test_worker_report_forwards_algo_trading_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_run_sync(_client, report, *, report_stage=None, cancel_event=None):  # type: ignore[no-untyped-def]
+        report(
+            sync.AccountProgress(
+                account_id=None, mt_login=None, phase=sync.PHASE_TERMINAL_CHECK, algo_trading_allowed=False
+            )
+        )
+        return sync.RunSummary()
+
+    monkeypatch.setattr(sync, "run_sync", _fake_run_sync)
+    window, _fake_root = _make_bare_window()
+    window._run_sync_worker(object(), None)  # type: ignore[arg-type]
+    events = _drain(window)
+
+    assert isinstance(events[0], ui_state.AccountProgressEvent)
+    assert events[0].algo_trading_allowed is False
+
+
 def test_autostart_toggle_shows_the_verified_state_not_the_requested_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     window, _fake_root = _make_bare_window()
     window._autostart_var = _FakeBooleanVar(True)  # type: ignore[attr-defined]
-    monkeypatch.setattr(autostart, "create_task", lambda: None)  # "succeeded"
-    monkeypatch.setattr(autostart, "task_is_registered_for_this_exe", lambda: False)
+    monkeypatch.setattr(autostart, "enable_autostart", lambda: None)  # "succeeded"
+    monkeypatch.setattr(autostart, "autostart_enabled_for_this_exe", lambda: False)
 
     window._on_autostart_toggled()
 
