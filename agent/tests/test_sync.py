@@ -18,7 +18,9 @@ from typing import Any, Optional
 import pytest
 
 from agent import api_client as api_client_module
-from agent import errors, mt5_bridge, sync
+from agent import errors, mt5_bridge, sync, terminal_discovery, terminal_process
+
+_FAKE_TERMINAL_PATH = r"C:\Fake\MetaTrader 5\terminal64.exe"
 
 
 # ---------------------------------------------------------------------------
@@ -154,13 +156,57 @@ def stub_bridge(monkeypatch: pytest.MonkeyPatch):
                 raise RuntimeError("stop/target read failed")
             return self.stop_take_profit_by_position.get(position_id, (None, None))
 
-        def initialize_terminal(self, path=None):
+        def initialize_terminal(self, path=None, **_kwargs):
+            self.initialize_calls.append(path)
+            self.call_order.append(("initialize", path))
+            on_tick = _kwargs.get("on_tick")
+            if on_tick is not None:
+                for seconds in self.ticks:
+                    on_tick(seconds)
+            if self.initialize_raises is not None:
+                raise self.initialize_raises
             return self.initialize_ok
 
         def current_logged_in_account(self):
             return self.pre_existing_session
 
+        def find_terminal_path(self):
+            return self.terminal_path
+
+        def list_terminal_processes(self):
+            return self.running
+
+        def current_process_elevated(self):
+            return self.self_elevated
+
+        def launch_terminal_minimized(self, path):
+            self.launch_calls.append(path)
+            self.call_order.append(("launch", path))
+            if self.launch_raises is not None:
+                raise self.launch_raises
+            return 4242
+
     stub = _Stub()
+    # Terminal discovery / process stubs — sync.run_sync now calls these itself, and a
+    # developer machine may have a REAL MetaTrader 5 installed and running. Default:
+    # one non-elevated terminal already running at the fake path, so nothing launches.
+    stub.terminal_path = _FAKE_TERMINAL_PATH
+    stub.running = [
+        terminal_process.RunningTerminal(
+            pid=1111, exe_path=_FAKE_TERMINAL_PATH, elevated=False, elevation_source="token"
+        )
+    ]
+    stub.self_elevated = False
+    stub.launch_calls = []
+    stub.launch_raises = None
+    stub.initialize_calls = []
+    stub.initialize_raises = None
+    stub.call_order = []
+    stub.ticks = []
+    monkeypatch.setattr(terminal_discovery, "find_terminal_path", stub.find_terminal_path)
+    monkeypatch.setattr(terminal_process, "list_terminal_processes", stub.list_terminal_processes)
+    monkeypatch.setattr(terminal_process, "current_process_elevated", stub.current_process_elevated)
+    monkeypatch.setattr(terminal_process, "launch_terminal_minimized", stub.launch_terminal_minimized)
     monkeypatch.setattr(mt5_bridge, "login_account", stub.login_account)
     monkeypatch.setattr(mt5_bridge, "last_error_tuple", stub.last_error_tuple)
     monkeypatch.setattr(mt5_bridge, "get_history_deals", stub.get_history_deals)
@@ -471,6 +517,221 @@ def test_run_sync_raises_sync_aborted_error_when_terminal_fails_to_initialize(
 
 
 # ---------------------------------------------------------------------------
+# 260925-k6y — find -> launch-if-needed -> connect
+# ---------------------------------------------------------------------------
+
+def _empty_fetch_client() -> _FakeApiClient:
+    client = _FakeApiClient()
+    client.fetch_accounts_result = api_client_module.AccountsFetchResult(token="tok", accounts=[])
+    return client
+
+
+def test_no_running_terminal_launches_discovered_path_before_initialize(stub_bridge) -> None:
+    stub_bridge.running = []
+
+    sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert stub_bridge.launch_calls == [_FAKE_TERMINAL_PATH]
+    assert stub_bridge.call_order[0] == ("launch", _FAKE_TERMINAL_PATH)
+    assert stub_bridge.call_order[1] == ("initialize", _FAKE_TERMINAL_PATH)
+
+
+def test_running_terminal_is_never_launched_again(stub_bridge) -> None:
+    sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert stub_bridge.launch_calls == []
+    assert stub_bridge.initialize_calls == [_FAKE_TERMINAL_PATH]
+
+
+def test_unknown_process_list_launches_nothing(stub_bridge) -> None:
+    stub_bridge.running = None
+
+    sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert stub_bridge.launch_calls == []
+
+
+def test_launch_oserror_raises_terminal_launch_error_and_never_initializes(stub_bridge) -> None:
+    stub_bridge.running = []
+    stub_bridge.launch_raises = OSError("access denied")
+
+    with pytest.raises(sync.TerminalLaunchError):
+        sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert stub_bridge.initialize_calls == []
+    assert issubclass(sync.TerminalLaunchError, sync.SyncAbortedError)
+
+
+def test_unresponsive_with_elevated_terminal_sets_elevation_mismatch(stub_bridge) -> None:
+    stub_bridge.running = [
+        terminal_process.RunningTerminal(
+            pid=7, exe_path=_FAKE_TERMINAL_PATH, elevated=True, elevation_source="access_denied_inference"
+        )
+    ]
+    stub_bridge.self_elevated = False
+    stub_bridge.initialize_raises = mt5_bridge.TerminalUnresponsiveError("hung", waited_seconds=90)
+
+    with pytest.raises(mt5_bridge.TerminalUnresponsiveError) as info:
+        sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert info.value.elevation_mismatch is True
+    assert info.value.waited_seconds == 90
+
+
+def test_unresponsive_without_elevated_terminal_has_no_elevation_mismatch(stub_bridge) -> None:
+    stub_bridge.initialize_raises = mt5_bridge.TerminalUnresponsiveError("hung", waited_seconds=90)
+
+    with pytest.raises(mt5_bridge.TerminalUnresponsiveError) as info:
+        sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert info.value.elevation_mismatch is False
+
+
+def test_no_terminal_found_raises_and_launches_nothing(stub_bridge) -> None:
+    stub_bridge.terminal_path = None
+    stub_bridge.running = []
+
+    with pytest.raises(terminal_discovery.TerminalNotFoundError):
+        sync.run_sync(_empty_fetch_client(), _Reporter())
+
+    assert stub_bridge.launch_calls == []
+    assert stub_bridge.initialize_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 260925-k6y Task 2 — stage reporting and between-steps cancel
+# ---------------------------------------------------------------------------
+
+class _StageRecorder:
+    """Records stage updates AND account progress into one ordered timeline."""
+
+    def __init__(self) -> None:
+        self.timeline: "list[tuple[str, Any]]" = []
+
+    def stage(self, progress: "sync.StageProgress") -> None:
+        self.timeline.append(("stage", (progress.stage, progress.status, progress.detail, progress.elapsed_seconds)))
+
+    def report(self, progress: "sync.AccountProgress") -> None:
+        self.timeline.append(("account", (progress.account_id, progress.phase)))
+
+    def stages(self) -> "list[tuple[str, str]]":
+        return [(s, st) for kind, (s, st, *_rest) in self.timeline if kind == "stage"]
+
+
+def _two_account_client() -> _FakeApiClient:
+    client = _FakeApiClient()
+    client.fetch_accounts_result = api_client_module.AccountsFetchResult(
+        token="tok", accounts=[_account(account_id="acc-1"), _account(account_id="acc-2")]
+    )
+    return client
+
+
+def test_no_launch_run_reports_stages_in_order_before_first_login(stub_bridge) -> None:
+    rec = _StageRecorder()
+
+    sync.run_sync(_two_account_client(), rec.report, report_stage=rec.stage)
+
+    expected = [
+        (sync.STAGE_FIND_TERMINAL, sync.STAGE_IN_PROGRESS),
+        (sync.STAGE_FIND_TERMINAL, sync.STAGE_DONE),
+        (sync.STAGE_CONNECT, sync.STAGE_IN_PROGRESS),
+        (sync.STAGE_CONNECT, sync.STAGE_DONE),
+        (sync.STAGE_FETCH_ACCOUNTS, sync.STAGE_IN_PROGRESS),
+        (sync.STAGE_FETCH_ACCOUNTS, sync.STAGE_DONE),
+    ]
+    assert rec.stages() == expected
+    details = {(v[0], v[1]): v[2] for kind, v in rec.timeline if kind == "stage"}
+    assert details[(sync.STAGE_FIND_TERMINAL, sync.STAGE_DONE)] == _FAKE_TERMINAL_PATH
+    assert details[(sync.STAGE_FETCH_ACCOUNTS, sync.STAGE_DONE)] == "2"
+
+    fetch_done_index = rec.timeline.index(
+        ("stage", (sync.STAGE_FETCH_ACCOUNTS, sync.STAGE_DONE, "2", None))
+    )
+    first_login_index = next(
+        i for i, (kind, value) in enumerate(rec.timeline)
+        if kind == "account" and value[1] == sync.PHASE_LOGIN
+    )
+    assert fetch_done_index < first_login_index
+
+
+def test_launch_run_also_reports_the_launch_stage(stub_bridge) -> None:
+    stub_bridge.running = []
+    rec = _StageRecorder()
+
+    sync.run_sync(_empty_fetch_client(), rec.report, report_stage=rec.stage)
+
+    stages = rec.stages()
+    assert (sync.STAGE_LAUNCH_TERMINAL, sync.STAGE_IN_PROGRESS) in stages
+    assert (sync.STAGE_LAUNCH_TERMINAL, sync.STAGE_DONE) in stages
+    assert stages.index((sync.STAGE_LAUNCH_TERMINAL, sync.STAGE_DONE)) < stages.index(
+        (sync.STAGE_CONNECT, sync.STAGE_IN_PROGRESS)
+    )
+
+
+def test_connect_tick_surfaces_as_elapsed_seconds(stub_bridge) -> None:
+    stub_bridge.ticks = [3]
+    rec = _StageRecorder()
+
+    sync.run_sync(_empty_fetch_client(), rec.report, report_stage=rec.stage)
+
+    assert ("stage", (sync.STAGE_CONNECT, sync.STAGE_IN_PROGRESS, None, 3)) in rec.timeline
+
+
+def test_failed_connect_reports_connect_failed_before_raising(stub_bridge) -> None:
+    stub_bridge.initialize_ok = False
+    rec = _StageRecorder()
+
+    with pytest.raises(sync.SyncAbortedError):
+        sync.run_sync(_empty_fetch_client(), rec.report, report_stage=rec.stage)
+
+    assert rec.stages()[-1] == (sync.STAGE_CONNECT, sync.STAGE_FAILED)
+
+
+def test_cancel_during_fetch_raises_after_token_saved_with_no_logins(
+    stub_bridge, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    from agent import config_store
+
+    saved: "list[str]" = []
+    monkeypatch.setattr(config_store, "save_token", saved.append)
+    cancel = threading.Event()
+    client = _two_account_client()
+    original_fetch = client.fetch_accounts
+
+    def _fetch_then_cancel():
+        cancel.set()
+        return original_fetch()
+
+    client.fetch_accounts = _fetch_then_cancel  # type: ignore[method-assign]
+
+    with pytest.raises(sync.SyncCancelledError):
+        sync.run_sync(client, _Reporter(), cancel_event=cancel)
+
+    assert saved == ["tok"]
+    assert stub_bridge.login_calls == []
+
+
+def test_cancel_when_first_account_done_leaves_second_unprocessed(stub_bridge) -> None:
+    import threading
+
+    cancel = threading.Event()
+    reporter = _Reporter()
+
+    def _report(progress):
+        reporter(progress)
+        if progress.phase == sync.PHASE_DONE:
+            cancel.set()
+
+    with pytest.raises(sync.SyncCancelledError):
+        sync.run_sync(_two_account_client(), _report, cancel_event=cancel)
+
+    assert len(stub_bridge.login_calls) == 1
+    assert not any(e.account_id == "acc-2" for e in reporter.events)
+
+
+# ---------------------------------------------------------------------------
 # Success path: aggregates + equity points sent on ok, nulled on failure
 # ---------------------------------------------------------------------------
 
@@ -722,7 +983,10 @@ def _tls_bypass_offenders(files: "list[pathlib.Path]") -> "list[str]":
 
 # ---- process-kill call (the defect 40-13 exists to fix) -------------------
 
-_KILL_CALL_ATTRS = {"kill", "pthread_kill"}
+# "terminate"/"TerminateProcess" added by quick task 260925-k6y: the program now STARTS
+# a process (the MT5 terminal, when none is running), so ending one — including the
+# one it started — must stay structurally impossible, not merely unconventional.
+_KILL_CALL_ATTRS = {"kill", "pthread_kill", "terminate", "TerminateProcess"}
 _KILL_STRING_SUBSTRING = "taskkill"
 
 
@@ -751,6 +1015,21 @@ def _process_kill_offenders(files: "list[pathlib.Path]") -> "list[str]":
                         f"{path}:{node.lineno} string constant contains "
                         f"{_KILL_STRING_SUBSTRING!r}"
                     )
+    return offenders
+
+
+# ---- no call ever passes a `shell` keyword ----------------------------------
+
+
+def _shell_keyword_offenders(files: "list[pathlib.Path]") -> "list[str]":
+    """Every `Call` node that passes a `shell=` keyword at all (any value) — the
+    program starts processes only from argument lists."""
+    offenders: "list[str]" = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and any(kw.arg == "shell" for kw in node.keywords):
+                offenders.append(f"{path}:{node.lineno} passes a shell= keyword")
     return offenders
 
 
@@ -1130,7 +1409,7 @@ class TestAgentFolderStructuralAudit:
     `agent/autostart.py` that was explaining, in prose, why that module has nothing to
     do with killing a process. Both are the same failure mode: the artifact getting
     bent to satisfy the check instead of the check being made to read what the code
-    actually DOES. The twelve claims this class enforces:
+    actually DOES. The thirteen claims this class enforces:
 
     1. No listening/serving construct is imported anywhere (`socket`,
        `socketserver`, `http.server`).
@@ -1145,8 +1424,9 @@ class TestAgentFolderStructuralAudit:
        assignment of `False` to a variable/attribute named `verify`) exists
        anywhere.
     7. No call that ends another process (`.kill(...)`, `os.kill(...)`,
-       `signal.pthread_kill(...)`, or the literal `taskkill` string outside a
-       docstring) exists anywhere.
+       `signal.pthread_kill(...)`, `.terminate(...)`, `TerminateProcess(...)`, or
+       the literal `taskkill` string outside a docstring) exists anywhere — not
+       even for the MT5 terminal this program itself may have started.
     8. The persisted authentication token is read from disk in exactly one
        place, and that read's value always passes through the DPAPI decrypt
        call before it can be returned — never handed back as plaintext.
@@ -1164,6 +1444,8 @@ class TestAgentFolderStructuralAudit:
         point makes — before the command line is parsed, before the
         configuration file is touched, and before the GUI toolkit's own root
         window is constructed.
+    13. No call anywhere passes a `shell` keyword — every process this program
+        starts (the MT5 terminal, `schtasks`) is started from an argument list.
     """
 
     @staticmethod
@@ -1377,6 +1659,30 @@ class TestAgentFolderStructuralAudit:
             encoding="utf-8",
         )
         assert not _process_kill_offenders([safe]), "a docstring mention must not be reported"
+
+        terminate_dir = tmp_path / "terminate"
+        terminate_dir.mkdir()
+        terminate = terminate_dir / "stopper.py"
+        terminate.write_text(
+            "def stop(proc):\n"
+            "    proc.terminate()\n",
+            encoding="utf-8",
+        )
+        assert _process_kill_offenders([terminate]), "a real .terminate() call must be reported"
+
+    def test_no_shell_keyword_anywhere(self, tmp_path: pathlib.Path) -> None:
+        """Claim 13: no `Call` in the tree passes `shell=` (any value)."""
+        offenders = _shell_keyword_offenders(self._agent_source_files())
+        assert not offenders, f"shell= keyword found: {offenders}"
+
+        violation = tmp_path / "shelly.py"
+        violation.write_text(
+            "import subprocess\n\n"
+            "def run(cmd):\n"
+            "    subprocess.run(cmd, shell=True)\n",
+            encoding="utf-8",
+        )
+        assert _shell_keyword_offenders([violation]), "a shell=True call must be reported"
 
     # -----------------------------------------------------------------------
     # 40-13 — five new claims this phase makes about the source.

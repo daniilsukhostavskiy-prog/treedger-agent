@@ -22,9 +22,14 @@ imports to suit a flat layout would edit 13 files and break that guarantee,
 and would contradict `agent/CHECKLIST-RU.md`, which already documents the
 source-run entry point as `python -m agent.main`.
 
-This shim keeps the built executable named `main.exe` in `main.dist/`, which
-is what `packaging/observe_runtime.ps1`, both workflows, the D-13 install
-instructions and the autostart task all already expect.
+This shim stays the BUILD entry point: Nuitka is pointed at `main.py`, so its
+standalone output folder is `build_output/main.dist/` — a build-internal name
+nobody downloads. Since quick task 260925-k6y the binary inside that folder is
+named `Treedger.exe` by Nuitka's `--output-filename=Treedger.exe` (both
+workflows), and the release step copies `main.dist` into a staging folder named
+`Treedger` and zips THAT folder, so the published archive contains exactly one
+top-level `Treedger/` folder with `Treedger/Treedger.exe` inside. The shim's code
+below is unchanged.
 """
 
 from agent.main import main

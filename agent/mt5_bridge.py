@@ -62,13 +62,33 @@ Deliberately NOT brought across, and why:
   fallback inside `terminal_discovery.find_terminal_path()` itself — never the
   primary discovery mechanism here, and never hardcoded a second time in this file.
 
+THE ONE EXCEPTION TO "SYNCHRONOUS": THE CONNECT WATCHDOG
+- `mt5.initialize()` is a blocking C call that can hang for as long as Windows keeps a
+  modal dialog (e.g. an "untrusted publisher" prompt) in front of the terminal it is
+  starting, or when the terminal runs elevated and this program does not. A live run
+  sat on «Проверка терминала…» forever because of that. So every `mt5.initialize()` in
+  `initialize_terminal()` now runs on a daemon helper thread joined against ONE
+  wall-clock deadline (`CONNECT_BUDGET_SECONDS`). Past the deadline the caller gets
+  `TerminalUnresponsiveError` and the window becomes usable again.
+- A blocking C call CANNOT be interrupted from Python. The helper thread is therefore
+  ABANDONED, not stopped, and the MetaTrader5 library's state is suspect for as long as
+  it lives. Rule: while it lives, no second MT5 call is ever made — a new connect
+  attempt raises `TerminalUnresponsiveError(still_blocked_from_previous=True)`,
+  `shutdown_terminal()` skips `mt5.shutdown()`, and `last_error_tuple()` returns None.
+- Connect order is attach-first: `mt5.initialize(timeout=...)` WITHOUT a path, and only
+  when that returns False, `mt5.initialize(<discovered path>, timeout=...)`. Each
+  attempt's variant, result, `last_error`, and elapsed seconds are logged, plus a narrow
+  whitelist of `terminal_info()` fields (never the money-bearing ones).
+
 SECURITY: `login_account()` NEVER logs the `password` argument.
 """
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime, timezone
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from agent import terminal_discovery
 from agent.error_codes import ErrorCategory, MT5_ERROR_CODES
@@ -115,12 +135,141 @@ IPC_UNAVAILABLE_ERROR_CODES: frozenset[int] = _codes_with_category(
 
 
 # ---------------------------------------------------------------------------
+# Connect watchdog — see the module header's "THE ONE EXCEPTION" section.
+# ---------------------------------------------------------------------------
+
+# Whole-connect wall-clock budget, both initialize variants together.
+CONNECT_BUDGET_SECONDS: float = 90.0
+# The attach-without-path attempt's own library timeout (ms). Short, because a
+# running, reachable terminal answers an attach in well under a second.
+ATTACH_TIMEOUT_MS: int = 20_000
+# How often the watchdog wakes to report elapsed time and check the deadline.
+WATCHDOG_TICK_SECONDS: float = 1.0
+
+# The helper thread of a timed-out mt5.initialize(), if one is still alive. Only
+# ever written by _call_with_watchdog() (set) and initialize_terminal() (cleared once
+# the thread has finished on its own).
+_abandoned_call: Optional[threading.Thread] = None
+
+
+class TerminalUnresponsiveError(Exception):
+    """
+    The MT5 terminal did not answer within `CONNECT_BUDGET_SECONDS`, or a previous
+    attempt's abandoned call is still blocked inside the library
+    (`still_blocked_from_previous=True`). `elevation_mismatch` is set by
+    `agent/sync.py` when a running terminal is elevated and this program is not —
+    the likeliest reason an attach can never succeed.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        waited_seconds: int = 0,
+        still_blocked_from_previous: bool = False,
+        elevation_mismatch: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.waited_seconds = waited_seconds
+        self.still_blocked_from_previous = still_blocked_from_previous
+        self.elevation_mismatch = elevation_mismatch
+
+
+def is_previous_call_still_blocked() -> bool:
+    """True while a timed-out mt5.initialize() helper thread is still alive."""
+    return _abandoned_call is not None and _abandoned_call.is_alive()
+
+
+def _call_with_watchdog(
+    fn: Callable[[], Any],
+    *,
+    deadline: float,
+    label: str,
+    on_tick: Optional[Callable[[int], None]],
+    started_at: float,
+) -> Any:
+    """
+    Run `fn` on a daemon thread named "mt5-<label>" and join it in
+    `WATCHDOG_TICK_SECONDS` slices against the monotonic `deadline`. After each slice
+    in which it is still running, `on_tick(elapsed_whole_seconds)` is called (the
+    window's live counter). Past the deadline the thread is ABANDONED — a blocking C
+    call cannot be interrupted, so it is not stopped, only left behind and remembered
+    in `_abandoned_call` so that no later MT5 call runs concurrently with it — and
+    `TerminalUnresponsiveError` is raised. An exception raised by `fn` itself is
+    re-raised on the caller's thread unchanged.
+    """
+    global _abandoned_call
+    box: "dict[str, Any]" = {}
+
+    def _runner() -> None:
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001 — handed back to the caller below
+            box["error"] = exc
+
+    helper = threading.Thread(target=_runner, name=f"mt5-{label}", daemon=True)
+    helper.start()
+    while True:
+        remaining = deadline - time.monotonic()
+        helper.join(max(0.0, min(WATCHDOG_TICK_SECONDS, remaining)))
+        if not helper.is_alive():
+            break
+        if on_tick is not None:
+            try:
+                on_tick(int(time.monotonic() - started_at))
+            except Exception:  # noqa: BLE001 — a progress callback must never break the watchdog
+                logger.exception("connect watchdog: on_tick callback failed")
+        if time.monotonic() >= deadline:
+            _abandoned_call = helper
+            waited = int(time.monotonic() - started_at)
+            logger.error(
+                "connect watchdog: %s did not return within %d s — helper thread "
+                "abandoned (a blocking MT5 call cannot be interrupted); no further MT5 "
+                "call will be made while it is alive",
+                label, waited,
+            )
+            raise TerminalUnresponsiveError(
+                f"MetaTrader 5 terminal did not respond within {waited} s",
+                waited_seconds=waited,
+            )
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def _log_terminal_info() -> None:
+    """Log a narrow whitelist of terminal_info() fields. NEVER the whole namedtuple:
+    it carries `community_balance`, and money never goes into this log."""
+    try:
+        info = mt5.terminal_info()
+    except Exception as exc:  # noqa: BLE001 — diagnostics only
+        logger.warning("terminal_info() raised %s", exc.__class__.__name__)
+        return
+    if info is None:
+        logger.warning("terminal_info() returned None: %s", mt5.last_error())
+        return
+    logger.info(
+        "terminal_info: name=%s company=%s build=%s path=%s connected=%s",
+        getattr(info, "name", None),
+        getattr(info, "company", None),
+        getattr(info, "build", None),
+        getattr(info, "path", None),
+        getattr(info, "connected", None),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Terminal lifecycle
 # ---------------------------------------------------------------------------
 
-def initialize_terminal(path: Optional[str] = None) -> bool:
+def initialize_terminal(
+    path: Optional[str] = None,
+    *,
+    on_tick: Optional[Callable[[int], None]] = None,
+) -> bool:
     """
-    Attach to (or launch) the MT5 terminal.
+    Attach to (or launch) the MT5 terminal, never for longer than
+    `CONNECT_BUDGET_SECONDS` in total.
 
     `path` should be the `terminal64.exe` path `terminal_discovery.find_terminal_path()`
     already located — pass it explicitly, or leave it `None` to let this function
@@ -134,11 +283,19 @@ def initialize_terminal(path: Optional[str] = None) -> bool:
     override for this path — see `terminal_discovery.py`'s own module docstring for
     why. Do not add one back here "for convenience".
 
-    Returns True on success, False if MetaTrader5 is unavailable in this
-    environment or the terminal itself failed to initialise — this mirrors the
-    donor's own bool contract and never raises for THAT failure mode, only for the
-    "no path found anywhere" one above.
+    Order: (A) `mt5.initialize(timeout=...)` with NO path — attaches to a terminal
+    that is already running; (B) only if A returned False, `mt5.initialize(path,
+    timeout=...)` with the path as the unnamed first parameter, as the official docs
+    define it. Both run under the connect watchdog; `on_tick(elapsed_seconds)` is
+    called about once a second while either is in progress.
+
+    Returns True on success, False if MetaTrader5 is unavailable in this environment
+    or both attempts returned False. Raises `TerminalUnresponsiveError` when the
+    budget runs out, or immediately when a previous attempt's abandoned call is still
+    blocked in the library.
     """
+    global _abandoned_call
+
     if path is None:
         path = terminal_discovery.find_terminal_path()
     if path is None:
@@ -150,17 +307,74 @@ def initialize_terminal(path: Optional[str] = None) -> bool:
         logger.warning("MetaTrader5 library not available — terminal not initialised")
         return False
 
-    ok: bool = bool(mt5.initialize(path=path))
-    if ok:
-        logger.info("MT5 terminal initialised at %s", path)
-    else:
-        logger.error("mt5.initialize(path=%s) failed: %s", path, mt5.last_error())
-    return ok
+    if _abandoned_call is not None:
+        if _abandoned_call.is_alive():
+            logger.error(
+                "initialize_terminal refused: the previous attempt's mt5.initialize() "
+                "is still blocked (thread %s)", _abandoned_call.name,
+            )
+            raise TerminalUnresponsiveError(
+                "a previous MetaTrader 5 connect attempt is still blocked",
+                still_blocked_from_previous=True,
+            )
+        logger.info("the previously abandoned mt5.initialize() call has since finished; continuing")
+        _abandoned_call = None
+
+    started_at = time.monotonic()
+    deadline = started_at + CONNECT_BUDGET_SECONDS
+
+    def _remaining_ms() -> int:
+        return int((deadline - time.monotonic()) * 1000)
+
+    # Attempt A — attach to an already-running terminal, no path.
+    timeout_a = max(1, min(ATTACH_TIMEOUT_MS, _remaining_ms()))
+    logger.info("connect attempt A: mt5.initialize(timeout=%d) without a path", timeout_a)
+    ok_a = bool(
+        _call_with_watchdog(
+            lambda: mt5.initialize(timeout=timeout_a),
+            deadline=deadline, label="initialize-attach", on_tick=on_tick, started_at=started_at,
+        )
+    )
+    logger.info("connect attempt A returned %s after %.1f s", ok_a, time.monotonic() - started_at)
+    if ok_a:
+        _log_terminal_info()
+        return True
+    logger.warning("connect attempt A last_error=%s", mt5.last_error())
+
+    if deadline - time.monotonic() < 1.0:
+        logger.error(
+            "connect: no budget left for attempt B after %.1f s", time.monotonic() - started_at
+        )
+        return False
+
+    # Attempt B — the discovered path, POSITIONAL (the docs' unnamed first parameter).
+    timeout_b = max(1000, _remaining_ms() - 2000)
+    logger.info("connect attempt B: mt5.initialize(%s, timeout=%d)", path, timeout_b)
+    ok_b = bool(
+        _call_with_watchdog(
+            lambda: mt5.initialize(path, timeout=timeout_b),
+            deadline=deadline, label="initialize-path", on_tick=on_tick, started_at=started_at,
+        )
+    )
+    logger.info("connect attempt B returned %s after %.1f s", ok_b, time.monotonic() - started_at)
+    if ok_b:
+        _log_terminal_info()
+        return True
+    logger.error("connect attempt B last_error=%s — terminal not initialised", mt5.last_error())
+    return False
 
 
 def shutdown_terminal() -> None:
-    """Disconnect from the MT5 terminal. Call once when this program exits."""
+    """
+    Disconnect from the MT5 terminal (IPC only — the terminal process itself keeps
+    running). Call once when this program exits. Skipped while a timed-out
+    `mt5.initialize()` is still blocked: calling into the library concurrently with
+    that abandoned call is exactly what the watchdog rule forbids.
+    """
     if not MT5_AVAILABLE:
+        return
+    if is_previous_call_still_blocked():
+        logger.warning("shutdown_terminal skipped: an abandoned mt5.initialize() is still blocked")
         return
     mt5.shutdown()
     logger.info("MT5 terminal shut down")
@@ -243,6 +457,12 @@ def login_account(login: int, password: str, server: str) -> bool:
         "and retrying once (no further escalation — see module header)",
         err, login,
     )
+    # Deliberately NOT wrapped in the connect watchdog: this only ever runs after a
+    # successful attach earlier in the same run, against a terminal that is already
+    # running and answering. Wrapping it would make TerminalUnresponsiveError escape
+    # from here into sync_one_account(), whose never-raise catch-all would then have to
+    # re-raise it — a contract change out of scope for the hang fix (recorded as a
+    # residual risk in quick task 260925-k6y's SUMMARY).
     reinit_ok: bool = bool(mt5.initialize())
     if not reinit_ok:
         logger.error(
@@ -285,6 +505,9 @@ def last_error_tuple() -> Optional[tuple[int, str]]:
     tuple itself, it only exposes it.
     """
     if not MT5_AVAILABLE:
+        return None
+    if is_previous_call_still_blocked():
+        # Never call into the library alongside an abandoned blocking call.
         return None
     return mt5.last_error()
 

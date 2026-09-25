@@ -45,6 +45,7 @@ this module never raises `TerminalNotFoundError` itself (see below).
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional, TypedDict
 
@@ -56,6 +57,8 @@ except ImportError:
     # missing winreg degrades every registry lookup below to "zero hits" — never a
     # crash.
     winreg = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
 
 
 class TerminalNotFoundError(Exception):
@@ -244,11 +247,34 @@ def find_terminal_path() -> Optional[str]:
     (`agent/mt5_bridge.py`'s `initialize_terminal()`, a later plan) is the one that
     raises `TerminalNotFoundError` for the GUI to show.
     """
-    for candidate in enumerate_registry_candidates():
+    try:
+        candidates = enumerate_registry_candidates()
+    except Exception:  # noqa: BLE001 — "never raises" holds even for an unexpected error
+        logger.exception("terminal discovery: registry scan failed")
+        candidates = []
+
+    for candidate in candidates:
+        logger.info(
+            "terminal discovery: registry candidate hive=%s view=%s display_name=%s "
+            "exe_path=%s exists=%s",
+            candidate["hive"], candidate["view"], candidate["display_name"],
+            candidate["exe_path"], candidate["exists"],
+        )
+
+    for candidate in candidates:
         if candidate["exists"]:
+            logger.info(
+                "terminal discovery: chose registry candidate %s (%s, %s)",
+                candidate["exe_path"], candidate["hive"], candidate["view"],
+            )
             return candidate["exe_path"]
 
     if os.path.isfile(_CONVENTIONAL_FALLBACK_PATH):
+        logger.info(
+            "terminal discovery: no usable registry candidate, using the conventional "
+            "fallback path %s", _CONVENTIONAL_FALLBACK_PATH,
+        )
         return _CONVENTIONAL_FALLBACK_PATH
 
+    logger.warning("terminal discovery: no terminal64.exe found (registry and fallback): none")
     return None

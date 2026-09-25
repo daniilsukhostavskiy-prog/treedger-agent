@@ -211,3 +211,23 @@ def test_find_terminal_path_returns_none_when_nothing_found(tmp_path, monkeypatc
     )
 
     assert find_terminal_path() is None
+
+
+def test_find_terminal_path_logs_the_chosen_path(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from agent import terminal_discovery as _td
+
+    exe = tmp_path / "terminal64.exe"
+    exe.write_text("", encoding="utf-8")
+    candidate = {
+        "hive": "HKCU", "view": "native", "display_name": "MetaTrader 5",
+        "install_location": str(tmp_path), "exe_path": str(exe), "exists": True,
+    }
+    monkeypatch.setattr(_td, "enumerate_registry_candidates", lambda: [candidate])
+
+    with caplog.at_level(logging.INFO, logger="agent.terminal_discovery"):
+        assert _td.find_terminal_path() == str(exe)
+
+    assert "chose registry candidate" in caplog.text
+    assert str(exe) in caplog.text

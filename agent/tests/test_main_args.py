@@ -169,3 +169,33 @@ def test_main_module_never_imports_argparse() -> None:
             offenders.append(f"{source_path}:{node.lineno} imports from argparse")
 
     assert not offenders, f"argparse import found: {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# 260925-k6y — button labels, decided by `ast` (the text= constants of every
+# tk.Button call in main.py), never by a text search.
+# ---------------------------------------------------------------------------
+
+
+def _button_texts() -> "list[str]":
+    source_path = pathlib.Path(main.__file__)
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    texts: "list[str]" = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "Button"):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "text" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                texts.append(kw.value.value)
+    return texts
+
+
+def test_window_buttons_are_synchronize_cancel_and_open_log_folder() -> None:
+    texts = _button_texts()
+    assert "Синхронизировать" in texts
+    assert "Отменить" in texts
+    assert "Открыть папку журнала" in texts
+    assert "Обновить" not in texts

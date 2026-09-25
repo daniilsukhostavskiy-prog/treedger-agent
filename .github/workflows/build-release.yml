@@ -25,7 +25,24 @@ env:
   # failure on real build output, never pre-guessed. --standalone is locked
   # project-wide; the single-executable bundling mode is never used anywhere
   # in this workflow.
-  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy --nofollow-import-to=agent.tests"
+  #
+  # Quick task 260925-k6y adds two flags (both verified against Nuitka 4.2.2's own
+  # `--help`; this file must stay IDENTICAL to probe-window.yml's NUITKA_FLAGS):
+  # - --windows-console-mode=disable: the black console window is now deliberately
+  #   suppressed. This is safe to do only because the program now writes its own
+  #   rotating log file (agent/diagnostics.py, %APPDATA%\TreedgerAgent\logs\agent.log),
+  #   so a console-less build is still diagnosable. Nuitka issue #3019 reported that a
+  #   --standalone tkinter window may never appear with a console-suppression flag;
+  #   probe-window.yml measures D27_WINDOW_RENDERED under exactly these flags. If that
+  #   probe reports no window, revert this flag in BOTH workflow files and record
+  #   #3019 as a confirmed limitation.
+  # - --output-filename=Treedger.exe: renames ONLY the binary. The dist folder stays
+  #   build_output/main.dist (named after the main.py build shim) — that folder is
+  #   build-internal; the release zip below ships it as a single top-level Treedger/
+  #   folder instead. (--output-folder-name is NOT used: it always appends ".dist".)
+  # Changing this value changes the cache key below; its restore-keys prefix still
+  # restores the previous cache, so the next run is not a full cold 23-minute build.
+  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy --nofollow-import-to=agent.tests --windows-console-mode=disable --output-filename=Treedger.exe"
   # A deliberately invalid bearer token, planted into config.json before the
   # runtime-observation launch below. The program must reach its own
   # authorization-failure path and stop there — this value is never a real
@@ -183,12 +200,21 @@ jobs:
         # that default GitHub Actions behaviour).
         shell: pwsh
         run: |
-          & ./packaging/observe_runtime.ps1 -ExePath "build_output/main.dist/main.exe" -BaseUrlHost $env:TREEDGER_AGENT_BASE_URL_HOST -DurationSeconds 30
+          & ./packaging/observe_runtime.ps1 -ExePath "build_output/main.dist/Treedger.exe" -BaseUrlHost $env:TREEDGER_AGENT_BASE_URL_HOST -DurationSeconds 30
 
       - name: Package the standalone build + compute its hash
         # D-16 rejects a binary text audit outright — this step never reads
         # build_output/main.dist as text for any prohibited-string search; it
-        # only zips the directory and hashes the resulting archive.
+        # only copies the directory, zips it, checks the archive's entry NAMES
+        # (never file contents), and hashes the archive.
+        #
+        # Layout (quick task 260925-k6y): the archive holds exactly ONE top-level
+        # folder, Treedger/, with Treedger/Treedger.exe inside — instead of ~980
+        # files spilled at the archive root next to a binary called main.exe. The
+        # folder itself (not its contents with a wildcard) is what goes into
+        # Compress-Archive, which is what produces the single top-level folder.
+        # The asset name is unchanged: the web route /download/agent matches
+        # ^treedger-agent-.+-windows\.zip$.
         id: package
         shell: pwsh
         run: |
@@ -196,7 +222,28 @@ jobs:
           $shortSha = "${{ github.sha }}".Substring(0, 7)
           $tag = if ($refName) { $refName } else { "dev-$shortSha" }
           $archiveName = "treedger-agent-$tag-windows.zip"
-          Compress-Archive -Path "build_output/main.dist/*" -DestinationPath $archiveName -Force
+          if (Test-Path "release_staging") { Remove-Item -Recurse -Force "release_staging" }
+          New-Item -ItemType Directory -Path "release_staging" | Out-Null
+          Copy-Item -Path "build_output/main.dist" -Destination "release_staging/Treedger" -Recurse
+          Compress-Archive -Path "release_staging/Treedger" -DestinationPath $archiveName -Force
+          # Layout assertion — fails the release unless every entry sits under
+          # Treedger/ and Treedger/Treedger.exe exists.
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $archiveName).Path)
+          try {
+            $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+          } finally {
+            $zip.Dispose()
+          }
+          Write-Host "Archive entries: $($entries.Count)"
+          $outside = @($entries | Where-Object { -not $_.StartsWith("Treedger/") })
+          if ($outside.Count -gt 0) {
+            throw "Release zip layout invalid: $($outside.Count) entries outside Treedger/ (first: $($outside[0]))"
+          }
+          if (-not ($entries -contains "Treedger/Treedger.exe")) {
+            throw "Release zip layout invalid: Treedger/Treedger.exe is missing"
+          }
+          Write-Host "Release zip layout OK: single top-level Treedger/ folder with Treedger/Treedger.exe"
           $hash = (Get-FileHash -Algorithm SHA256 -Path $archiveName).Hash
           $hashFileName = "$archiveName.sha256.txt"
           $commitSha = "${{ steps.structural_audit.outputs.commit_sha }}"

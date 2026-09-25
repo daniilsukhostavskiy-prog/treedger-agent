@@ -1,5 +1,11 @@
 """
-agent/config_store.py — the ONLY place this program persists anything to disk.
+agent/config_store.py — the ONLY place this program persists CONFIGURATION to disk.
+
+The one other thing this program writes under the same per-user folder is its
+diagnostic log, in a `logs/` subfolder owned entirely by `agent/diagnostics.py`
+(which reaches the folder through `app_data_dir()` below). That log is not
+configuration, is never read back by this program, and never contains the bearer
+token, the investor password or the pairing code.
 
 Deliberately trivial, by design: one JSON
 file, exactly two keys, standard-library `json` only. This module is not a general
@@ -77,6 +83,15 @@ def _app_data_dir() -> Path:
     if appdata:
         return Path(appdata) / _APP_DIR_NAME
     return Path.home() / f".{_APP_DIR_NAME.lower()}"
+
+
+def app_data_dir() -> Path:
+    """
+    Public accessor for the per-user application-data folder (see `_app_data_dir`).
+    Used by `agent/diagnostics.py` to place its `logs/` subfolder beside
+    `config.json`. Adds no config key — this module's two-key rule is unchanged.
+    """
+    return _app_data_dir()
 
 
 def config_path() -> Path:

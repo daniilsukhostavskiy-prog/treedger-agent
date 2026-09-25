@@ -56,10 +56,12 @@ There are two ways to run this program. Most people want the first one.
 
 ### The released executable
 
-Download the release archive from this repository's Releases page, unzip it, and run the
-`.exe` inside — see **Where it installs** and **Verifying what you downloaded** below
-before you run it for the first time. No Python installation is needed for this path; the
-executable is self-contained.
+Download the release archive from this repository's Releases page and unzip it. Open the
+`Treedger` folder inside and run `Treedger.exe` — keep every other file in that folder
+beside it (the program needs them; do not move `Treedger.exe` out on its own). See
+**Where it installs** and **Verifying what you downloaded** below before you run it for the
+first time. No Python installation is needed for this path; the folder is self-contained,
+and no console window opens.
 
 ### From source (for development)
 
@@ -134,6 +136,11 @@ iconified.
 The program syncs once an hour while its window is open, however it was launched —
 manually or via autostart.
 
+The checkbox shows the real state of the Windows scheduled task: it reads as ticked only
+when a `TreedgerAgent` task exists AND points at this very executable. After every click
+the program re-reads the task and shows what is actually registered. A task left pointing
+at an old folder is repaired silently on start (never created), and only then shown.
+
 ## Single instance
 
 If the program is already running and you start it again, the second copy brings the
@@ -154,11 +161,49 @@ never starts a second connection to your MT5 terminal.
 4. Paste the code and press **«Привязать»**. The program exchanges it for a real,
    long-lived token, which it stores locally, encrypted, and the window moves to the
    account list.
-5. Press **«Обновить»**. The program walks every one of your accounts one at a time,
-   showing each one's row update live.
+5. Press **«Синхронизировать»**. The program walks every one of your accounts one at a
+   time, showing each one's row update live.
 
 If MetaTrader 5 cannot be found on your computer at all, the window shows a plain,
 non-crashing notice instead of the account list — see **Troubleshooting** below.
+
+### What the window shows during a run
+
+- A stage list, each line marked `…` (in progress), `✓` (done), `✗` (failed) or `–`
+  (cancelled):
+  - **Поиск терминала** — with the path of the `terminal64.exe` that was found;
+  - **Запуск терминала** — only when the program had to start MetaTrader 5 itself;
+  - **Подключение к терминалу** — with a live seconds counter. It can never run forever:
+    after about 90 seconds the run stops with «Терминал MetaTrader 5 не отвечает…» and a
+    hint to look for a Windows dialog hidden behind other windows;
+  - **Получение списка счетов** — with the number of accounts found;
+  - then one row per account (see below).
+- **«Отменить»** stops the run *after the current step* — a call already waiting on the
+  terminal cannot be interrupted, only bounded by that 90-second limit.
+- **Последняя успешная синхронизация** — the time of the last run in which at least one
+  account synced (kept only while the window is open).
+- A red line under the header when a whole run failed (terminal not responding, could not
+  be started, server unreachable, unexpected error).
+
+### MetaTrader 5 is started for you
+
+If no MetaTrader 5 terminal is running when a sync starts, the program starts the one it
+found, minimized and without taking focus (Windows and MetaTrader may still restore the
+terminal's own saved window position — that request is best-effort). If a terminal is
+already running, nothing is started. The program never closes, restarts or ends the
+terminal — not even one it started itself; closing the program's window only disconnects
+from it.
+
+### Diagnostic log
+
+Every start writes a log to `%APPDATA%\TreedgerAgent\logs\agent.log` (UTF-8, rotated at
+1 MB, three old files kept). It contains the program version, Windows version, the
+executable path, which terminal was found and whether it was already running (and whether
+it or this program runs as administrator), every connection attempt with its result, error
+code and elapsed time, per-account outcomes, and any unexpected error with its traceback.
+It never contains your investor password, the program's token, or the pairing code. The
+**«Открыть папку журнала»** button, at the bottom of every screen, opens that folder — if
+something goes wrong, send `agent.log` to support.
 
 ### What each account row means
 

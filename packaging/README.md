@@ -40,10 +40,13 @@ files resolve against.
    `packaging/assert_dpapi_executed.py` stay under `packaging/` at the new root — the
    workflows reference them at that path.
 4. Copy `packaging/root_main.py` to the new repository's root, renaming it to `main.py`.
-   This three-line shim (`from agent.main import main`) is the build entry point. It is the
-   reason the produced executable is still called `main.exe` inside `main.dist/`, which is
-   what `packaging/observe_runtime.ps1`, both workflows, the D-13 install instructions and
-   the autostart task all already expect. It is not part of the `agent` package and the
+   This three-line shim (`from agent.main import main`) is the build entry point, so
+   Nuitka's standalone output folder is `build_output/main.dist/` — a build-internal name
+   nobody downloads. The binary inside it is named `Treedger.exe` by
+   `--output-filename=Treedger.exe` (both workflows' `NUITKA_FLAGS`), and that is the path
+   `packaging/observe_runtime.ps1` is pointed at (`build_output/main.dist/Treedger.exe`).
+   The release zip ships the folder as a single top-level `Treedger/` folder (see
+   **Release archive layout** below). The shim is not part of the `agent` package and the
    package never imports it.
 5. Move `agent/.gitignore` to the new repository's root.
 6. Commit once, as the initial commit of the new repository.
@@ -59,6 +62,24 @@ treedger-agent/
 ├── main.py         ← packaging/root_main.py, renamed
 └── .gitignore
 ```
+
+### Release archive layout
+
+`build-release.yml` copies `build_output/main.dist` to `release_staging/Treedger` and
+zips that FOLDER (not its contents), so `treedger-agent-<tag>-windows.zip` contains exactly
+one top-level folder:
+
+```
+Treedger/
+├── Treedger.exe      ← the program (no console window: --windows-console-mode=disable)
+└── …                 ← the runtime files it needs; they must stay beside Treedger.exe
+```
+
+Before hashing, the workflow opens the zip and fails the release unless every entry starts
+with `Treedger/` and `Treedger/Treedger.exe` exists. The asset name pattern is unchanged
+(`^treedger-agent-.+-windows\.zip$`, which the site's `/download/agent` route matches).
+Releases up to and including v0.1.0 used the old layout (`main.exe` plus ~980 files at the
+archive root).
 
 ### Why the package must not be flattened
 

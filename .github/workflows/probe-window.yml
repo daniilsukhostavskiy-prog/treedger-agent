@@ -35,7 +35,21 @@ env:
   # human checkpoint (40-CONTEXT.md D-18), never pre-guessed from documentation.
   # --standalone is locked project-wide; the single-executable bundling mode is
   # never used, in this workflow or anywhere else in this phase.
-  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy --nofollow-import-to=agent.tests"
+  #
+  # Quick task 260925-k6y adds two flags, identical to build-release.yml's
+  # NUITKA_FLAGS (both verified against Nuitka 4.2.2's own `--help`):
+  # - --windows-console-mode=disable: suppresses the black console window. Added on
+  #   purpose now that the program writes its own rotating log file
+  #   (agent/diagnostics.py), which is what keeps a console-less build diagnosable.
+  #   THIS probe is the measurement that decides whether the flag stays: Nuitka issue
+  #   #3019 reported a --standalone tkinter window that never appears with a
+  #   console-suppression flag. If D27_WINDOW_RENDERED comes back "no", revert the
+  #   flag in BOTH workflow files and record #3019 as a confirmed limitation.
+  # - --output-filename=Treedger.exe: renames only the binary; the dist folder stays
+  #   build_output/main.dist.
+  # Changing this value changes the cache key; its restore-keys prefix still restores
+  # the previous cache, so this is not a full cold build.
+  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy --nofollow-import-to=agent.tests --windows-console-mode=disable --output-filename=Treedger.exe"
   # A deliberately invalid bearer token, planted into config.json before every
   # launch below. The program must reach its own authorization-failure path and
   # stop there — this value is never a real token and is never sent anywhere
@@ -118,7 +132,7 @@ jobs:
         id: window_probe
         shell: pwsh
         run: |
-          $exePath = "build_output/main.dist/main.exe"
+          $exePath = "build_output/main.dist/Treedger.exe"
 
           # A REAL external observation, not the program's own claim: EnumWindows
           # + GetWindowThreadProcessId + IsWindowVisible via a raw P/Invoke
@@ -169,9 +183,12 @@ jobs:
           # NOTE: at least one open Nuitka issue (#3019, 40-RESEARCH.md Pitfall 1)
           # reports a tkinter program that builds fine and shows no window at all
           # when a console-suppression flag is combined with --standalone on some
-          # Nuitka versions. That flag is deliberately NOT used anywhere in this
-          # build — testing it here would confound the one question this probe
-          # exists to answer.
+          # Nuitka versions. Since quick task 260925-k6y that flag
+          # (--windows-console-mode=disable) IS used, on purpose, in both this
+          # workflow and build-release.yml — and this probe is exactly the
+          # measurement that decides whether it stays. D27_WINDOW_RENDERED=no under
+          # these flags means: revert the console flag in BOTH workflow files and
+          # record #3019 as a confirmed limitation.
           $proc = Start-Process -FilePath $exePath -PassThru
 
           $windowRendered = $false
@@ -253,7 +270,7 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          & ./packaging/observe_runtime.ps1 -ExePath "build_output/main.dist/main.exe" -BaseUrlHost $env:TREEDGER_AGENT_BASE_URL_HOST -DurationSeconds 30
+          & ./packaging/observe_runtime.ps1 -ExePath "build_output/main.dist/Treedger.exe" -BaseUrlHost $env:TREEDGER_AGENT_BASE_URL_HOST -DurationSeconds 30
 
       - name: Print D-27 summary
         if: always()

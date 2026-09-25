@@ -31,3 +31,21 @@ def stub_mt5_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     stub = types.ModuleType("MetaTrader5")
     monkeypatch.setitem(sys.modules, "MetaTrader5", stub)
     return stub
+
+
+def _refuse_real_terminal_launch(*_args, **_kwargs):
+    raise AssertionError("tests must never launch a real MetaTrader terminal")
+
+
+@pytest.fixture(autouse=True)
+def _never_launch_a_real_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    AUTOUSE guard: `agent.sync.run_sync` now starts MetaTrader 5 itself when none is
+    running, and a developer's machine may well have a real MT5 installed. Every test
+    therefore gets a process launcher that FAILS the test loudly instead of starting
+    anything. Tests that exercise the launch path override `_popen` with their own
+    recorder.
+    """
+    from agent import terminal_process
+
+    monkeypatch.setattr(terminal_process, "_popen", _refuse_real_terminal_launch)

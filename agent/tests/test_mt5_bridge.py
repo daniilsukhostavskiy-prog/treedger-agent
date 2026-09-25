@@ -547,3 +547,187 @@ def test_no_test_asserts_ambient_mt5_availability():
         + " — inject it with the mt5_unavailable fixture instead. This exact "
         "pattern failed release run #2 on windows-latest."
     )
+
+
+# ---------------------------------------------------------------------------
+# 260925-k6y — attach-first connect order + the connect watchdog
+# ---------------------------------------------------------------------------
+
+import logging  # noqa: E402
+import threading  # noqa: E402
+
+_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+_RELEASE_EVENTS: "list[threading.Event]" = []
+
+
+@pytest.fixture(autouse=True)
+def _reset_abandoned_call(monkeypatch):
+    monkeypatch.setattr(mt5_bridge, "_abandoned_call", None)
+    yield
+    # Release every blocking fake so no helper thread outlives its test.
+    for event in _RELEASE_EVENTS:
+        event.set()
+    _RELEASE_EVENTS.clear()
+
+
+class _FakeInitMt5:
+    """Records every MT5 call in order; `results` feeds successive initialize() calls."""
+
+    def __init__(self, results, *, terminal_info=None, block_on=None):
+        self.results = list(results)
+        self.calls: "list[tuple]" = []
+        self._terminal_info = terminal_info
+        self._block_on = block_on
+        # Set once the helper thread has actually entered initialize(): under heavy
+        # machine load the helper may not have been scheduled yet when the watchdog
+        # gives up, so tests wait on this before inspecting `calls`.
+        self.entered = threading.Event()
+
+    def initialize(self, *args, **kwargs):
+        self.calls.append(("initialize", args, kwargs))
+        self.entered.set()
+        if self._block_on is not None:
+            self._block_on.wait(10)
+        return self.results.pop(0) if self.results else False
+
+    def last_error(self):
+        self.calls.append(("last_error", (), {}))
+        return (-10003, "IPC initialize failed")
+
+    def terminal_info(self):
+        self.calls.append(("terminal_info", (), {}))
+        return self._terminal_info
+
+    def shutdown(self):
+        self.calls.append(("shutdown", (), {}))
+
+
+def _install(monkeypatch, fake):
+    monkeypatch.setattr(mt5_bridge, "MT5_AVAILABLE", True)
+    monkeypatch.setattr(mt5_bridge, "mt5", fake)
+
+
+def test_attach_first_succeeds_with_one_call_without_a_path(monkeypatch):
+    fake = _FakeInitMt5([True])
+    _install(monkeypatch, fake)
+
+    assert mt5_bridge.initialize_terminal(_PATH) is True
+
+    init_calls = [c for c in fake.calls if c[0] == "initialize"]
+    assert len(init_calls) == 1
+    _name, args, kwargs = init_calls[0]
+    assert args == ()
+    assert "timeout" in kwargs
+    assert "path" not in kwargs
+
+
+def test_fallback_passes_path_positionally_after_reading_last_error(monkeypatch):
+    fake = _FakeInitMt5([False, True])
+    _install(monkeypatch, fake)
+
+    assert mt5_bridge.initialize_terminal(_PATH) is True
+
+    names = [c[0] for c in fake.calls]
+    first = names.index("initialize")
+    second = names.index("initialize", first + 1)
+    assert "last_error" in names[first + 1:second]
+    _name, args, kwargs = fake.calls[second]
+    assert args[0] == _PATH
+    assert "timeout" in kwargs
+
+
+def test_both_attempts_fail_returns_false_and_logs_last_error_each(monkeypatch, caplog):
+    fake = _FakeInitMt5([False, False])
+    _install(monkeypatch, fake)
+
+    with caplog.at_level(logging.INFO, logger="agent.mt5_bridge"):
+        assert mt5_bridge.initialize_terminal(_PATH) is False
+
+    text = caplog.text
+    assert "attempt A last_error" in text
+    assert "attempt B last_error" in text
+
+
+def test_watchdog_raises_within_budget_and_makes_no_further_mt5_call(monkeypatch):
+    release = threading.Event()
+    _RELEASE_EVENTS.append(release)
+    fake = _FakeInitMt5([True], block_on=release)
+    _install(monkeypatch, fake)
+    monkeypatch.setattr(mt5_bridge, "CONNECT_BUDGET_SECONDS", 0.3)
+    monkeypatch.setattr(mt5_bridge, "WATCHDOG_TICK_SECONDS", 0.05)
+
+    ticks: "list[int]" = []
+    import time as _time
+
+    started = _time.monotonic()
+    with pytest.raises(mt5_bridge.TerminalUnresponsiveError) as info:
+        mt5_bridge.initialize_terminal(_PATH, on_tick=ticks.append)
+    assert _time.monotonic() - started < 2.0
+
+    assert info.value.still_blocked_from_previous is False
+    assert ticks, "on_tick must be called at least once while blocked"
+    assert ticks == sorted(ticks)
+    assert fake.entered.wait(5)
+    assert [c[0] for c in fake.calls] == ["initialize"]
+    assert mt5_bridge.is_previous_call_still_blocked() is True
+
+
+def test_second_connect_while_abandoned_call_alive_is_refused_without_calling_mt5(monkeypatch):
+    release = threading.Event()
+    _RELEASE_EVENTS.append(release)
+    fake = _FakeInitMt5([True, True], block_on=release)
+    _install(monkeypatch, fake)
+    monkeypatch.setattr(mt5_bridge, "CONNECT_BUDGET_SECONDS", 0.2)
+    monkeypatch.setattr(mt5_bridge, "WATCHDOG_TICK_SECONDS", 0.05)
+
+    with pytest.raises(mt5_bridge.TerminalUnresponsiveError):
+        mt5_bridge.initialize_terminal(_PATH)
+    assert fake.entered.wait(5)
+    calls_after_timeout = len(fake.calls)
+
+    with pytest.raises(mt5_bridge.TerminalUnresponsiveError) as info:
+        mt5_bridge.initialize_terminal(_PATH)
+    assert info.value.still_blocked_from_previous is True
+    assert len(fake.calls) == calls_after_timeout
+    assert mt5_bridge.last_error_tuple() is None  # refused while blocked
+
+    # Once the abandoned call returns, the next attempt proceeds normally.
+    abandoned = mt5_bridge._abandoned_call
+    release.set()
+    abandoned.join(5)
+    monkeypatch.setattr(mt5_bridge, "CONNECT_BUDGET_SECONDS", 90.0)
+    assert mt5_bridge.initialize_terminal(_PATH) is True
+    assert mt5_bridge._abandoned_call is None
+
+
+def test_shutdown_is_skipped_while_abandoned_call_alive(monkeypatch, caplog):
+    fake = _FakeInitMt5([])
+    _install(monkeypatch, fake)
+    release = threading.Event()
+    _RELEASE_EVENTS.append(release)
+    blocked = threading.Thread(target=release.wait, args=(10,), daemon=True)
+    blocked.start()
+    monkeypatch.setattr(mt5_bridge, "_abandoned_call", blocked)
+
+    with caplog.at_level(logging.WARNING, logger="agent.mt5_bridge"):
+        mt5_bridge.shutdown_terminal()
+
+    assert fake.calls == []
+    assert "shutdown_terminal skipped" in caplog.text
+
+
+def test_terminal_info_logging_is_a_narrow_whitelist(monkeypatch, caplog):
+    info = types.SimpleNamespace(
+        name="MetaTrader 5", company="Broker Ltd", build=4755, path=r"C:\MT5",
+        connected=True, community_balance=987.65,
+    )
+    fake = _FakeInitMt5([True], terminal_info=info)
+    _install(monkeypatch, fake)
+
+    with caplog.at_level(logging.DEBUG):
+        assert mt5_bridge.initialize_terminal(_PATH) is True
+
+    assert "build=4755" in caplog.text
+    assert "connected=True" in caplog.text
+    assert "987.65" not in caplog.text
+    assert all("987.65" not in r.getMessage() for r in caplog.records)

@@ -33,7 +33,7 @@ import that would compromise the whole point of this file being pure.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Union
 
 # ---------------------------------------------------------------------------
@@ -58,6 +58,70 @@ PHASE_READING = "reading"
 PHASE_SENDING = "sending"
 PHASE_DONE = "done"
 PHASE_FAILED = "failed"
+
+# ---------------------------------------------------------------------------
+# Run stages — mirror `agent/sync.py`'s own `STAGE_*` strings verbatim, for the same
+# mirror-don't-import reason the phase constants above are a copy (see the module
+# docstring). `STAGE_CANCELLED` exists only here: sync.py never reports it; this
+# reducer turns an in-progress stage into it when a run is cancelled.
+# ---------------------------------------------------------------------------
+STAGE_FIND_TERMINAL = "find_terminal"
+STAGE_LAUNCH_TERMINAL = "launch_terminal"
+STAGE_CONNECT = "connect"
+STAGE_FETCH_ACCOUNTS = "fetch_accounts"
+
+STAGE_IN_PROGRESS = "in_progress"
+STAGE_DONE = "done"
+STAGE_FAILED = "failed"
+STAGE_CANCELLED = "cancelled"
+
+STAGE_ORDER: "tuple[str, ...]" = (
+    STAGE_FIND_TERMINAL,
+    STAGE_LAUNCH_TERMINAL,
+    STAGE_CONNECT,
+    STAGE_FETCH_ACCOUNTS,
+)
+
+STAGE_LABELS: "dict[str, str]" = {
+    STAGE_FIND_TERMINAL: "Поиск терминала",
+    STAGE_LAUNCH_TERMINAL: "Запуск терминала",
+    STAGE_CONNECT: "Подключение к терминалу",
+    STAGE_FETCH_ACCOUNTS: "Получение списка счетов",
+}
+
+_STAGE_ICONS: "dict[str, str]" = {
+    STAGE_IN_PROGRESS: "…",
+    STAGE_DONE: "✓",
+    STAGE_FAILED: "✗",
+    STAGE_CANCELLED: "–",
+}
+
+
+@dataclass(frozen=True)
+class StageState:
+    """One line of the stage list: which stage, its status, and its detail (found
+    path, «запущен свёрнутым», account count) or live connect seconds."""
+
+    stage: str
+    status: str
+    detail: Optional[str] = None
+    elapsed_seconds: Optional[int] = None
+
+
+def stage_line(stage_state: StageState) -> str:
+    """The exact text of one stage-list line, e.g. "✓ Поиск терминала — C:\\...\\terminal64.exe",
+    "… Подключение к терминалу — 12 с", "✓ Получение списка счетов — найдено: 2"."""
+    icon = _STAGE_ICONS.get(stage_state.status, "?")
+    label = STAGE_LABELS.get(stage_state.stage, stage_state.stage)
+    if stage_state.status == STAGE_CANCELLED:
+        return f"{icon} {label} — отменено"
+    if stage_state.stage == STAGE_FETCH_ACCOUNTS and stage_state.detail is not None:
+        suffix: Optional[str] = f"найдено: {stage_state.detail}"
+    elif stage_state.stage == STAGE_CONNECT and stage_state.elapsed_seconds is not None:
+        suffix = f"{stage_state.elapsed_seconds} с"
+    else:
+        suffix = stage_state.detail
+    return f"{icon} {label} — {suffix}" if suffix else f"{icon} {label}"
 
 # ---------------------------------------------------------------------------
 # Pinned notices — a small, closed set. Once a notice is pinned it is NEVER removed
@@ -95,6 +159,52 @@ NOTICE_TEXT: "dict[str, str]" = {
         f"Скачайте новую версию: {DOWNLOAD_URL}"
     ),
 }
+
+# ---------------------------------------------------------------------------
+# Whole-run failures — one short Russian line on the ready screen. Deliberately
+# none of these names a button: the button labels are the window's business
+# (agent/main.py) and change independently of this text.
+# ---------------------------------------------------------------------------
+RUN_ERROR_TERMINAL_UNRESPONSIVE = "terminal_unresponsive"
+RUN_ERROR_TERMINAL_STILL_BLOCKED = "terminal_still_blocked"
+RUN_ERROR_TERMINAL_FAILED = "terminal_failed"
+RUN_ERROR_LAUNCH_FAILED = "launch_failed"
+RUN_ERROR_SERVER = "server"
+RUN_ERROR_INTERNAL = "internal"
+
+_ELEVATION_HINT = (
+    "Похоже, MetaTrader 5 запущен от имени администратора, а эта программа — нет, "
+    "поэтому подключиться к нему нельзя. Закройте MetaTrader 5 и запустите его "
+    "обычным способом."
+)
+
+
+def run_error_text(
+    kind: str, *, elevation_mismatch: bool = False, waited_seconds: Optional[int] = None
+) -> str:
+    """The exact line the ready screen shows for a whole-run failure `kind`."""
+    if kind == RUN_ERROR_TERMINAL_UNRESPONSIVE:
+        text = (
+            f"Терминал MetaTrader 5 не отвечает ({waited_seconds or 0} с). Проверьте, не "
+            "открыто ли за окнами системное окно Windows (например, предупреждение о "
+            "запуске программы) — закройте его и повторите синхронизацию. Подробности — "
+            "в журнале программы."
+        )
+        if elevation_mismatch:
+            text = f"{text}\n{_ELEVATION_HINT}"
+        return text
+    if kind == RUN_ERROR_TERMINAL_STILL_BLOCKED:
+        return (
+            "Предыдущая попытка подключения к терминалу ещё не завершилась. Закройте "
+            "эту программу и запустите её заново."
+        )
+    if kind == RUN_ERROR_TERMINAL_FAILED:
+        return "Не удалось подключиться к терминалу MetaTrader 5. Подробности — в журнале программы."
+    if kind == RUN_ERROR_LAUNCH_FAILED:
+        return "Не удалось запустить MetaTrader 5. Подробности — в журнале программы."
+    if kind == RUN_ERROR_SERVER:
+        return "Не удалось связаться с сервером Treedger. Повторите синхронизацию позже."
+    return "Непредвиденная ошибка. Подробности — в журнале программы."
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +244,20 @@ class UiState:
     pairing_error: Optional[str] = None
     rate_limit_retry_after_seconds: Optional[int] = None
     refresh_disabled: bool = False
+    # The last whole-run failure, as the Russian text the ready screen shows under
+    # the rate-limit line (see run_error_text). Cleared when the next run starts.
+    run_error: Optional[str] = None
+    # The current (or last) run's stage list, keyed by STAGE_* — see ordered_stages().
+    stages: "dict[str, StageState]" = field(default_factory=dict)
+    # «Отменить» was pressed; the worker stops after the current step.
+    cancel_requested: bool = False
+    # «Последняя успешная синхронизация: …» — in memory only, never persisted.
+    last_success_label: Optional[str] = None
+
+    @property
+    def cancel_enabled(self) -> bool:
+        """«Отменить» is clickable only while a run is going and not yet cancelled."""
+        return self.screen == SCREEN_RUNNING and not self.cancel_requested
 
     @property
     def total_accounts(self) -> int:
@@ -241,12 +365,18 @@ class RateLimitedEvent:
 @dataclass(frozen=True)
 class RunFinishedEvent:
     """
-    `run_sync()` returned, or raised something not already handled by one of the
-    events above — `agent/main.py` fires this exactly once per run, from the
-    main-thread poller, so the `running` screen returns to `ready` and «Обновить»
-    is re-enabled. Rows stay exactly as they last were, so the user can read the
-    final tally before starting another run.
+    `run_sync()` returned (or a rate-limit ended the run) — `agent/main.py` fires this
+    at most once per run, so the `running` screen returns to `ready` and
+    «Синхронизировать» is re-enabled. Rows stay exactly as they last were, so the user
+    can read the final tally before starting another run. `succeeded`/`failed` are the
+    run's own counts; `finished_at_label` (a local "dd.mm.yyyy HH:MM" string built by
+    the window) becomes the «Последняя успешная синхронизация» line, but only when at
+    least one account succeeded. The no-argument form still works.
     """
+
+    succeeded: int = 0
+    failed: int = 0
+    finished_at_label: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -286,6 +416,53 @@ class ProtocolTooOldEvent:
     """
 
 
+@dataclass(frozen=True)
+class RunFailedEvent:
+    """
+    The whole run ended on a failure that is not a single account's (terminal
+    unresponsive or unreachable, a refused terminal launch, the server unreachable,
+    an unexpected error). `kind` is one of the `RUN_ERROR_*` constants; the ready
+    screen shows `run_error_text(kind, ...)` so the person is never left looking at
+    an endless «Проверка терминала…».
+    """
+
+    kind: str
+    elevation_mismatch: bool = False
+    waited_seconds: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class RunStartedEvent:
+    """
+    The run-start marker, dispatched on the main thread the moment a sync is started
+    (before the worker thread even exists): the screen goes to `running`, the previous
+    run's rows, stages and failure line are cleared, «Синхронизировать» is disabled and
+    «Отменить» enabled. The last successful sync time is kept.
+    """
+
+
+@dataclass(frozen=True)
+class StageProgressEvent:
+    """Mirrors one `agent.sync.StageProgress` (see the module docstring for why this
+    is a copy, not an import). A field left `None` keeps the stage's previous value,
+    so a bare "failed" update does not erase the connect counter or the found path."""
+
+    stage: str
+    status: str
+    detail: Optional[str] = None
+    elapsed_seconds: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class CancelRequestedEvent:
+    """«Отменить» was pressed. Only meaningful while running; a no-op otherwise."""
+
+
+@dataclass(frozen=True)
+class RunCancelledEvent:
+    """The worker stopped at a step boundary after «Отменить» (`SyncCancelledError`)."""
+
+
 Event = Union[
     AccountProgressEvent,
     PairingSucceededEvent,
@@ -295,7 +472,26 @@ Event = Union[
     RunFinishedEvent,
     TerminalNotFoundEvent,
     ProtocolTooOldEvent,
+    RunFailedEvent,
+    RunStartedEvent,
+    StageProgressEvent,
+    CancelRequestedEvent,
+    RunCancelledEvent,
 ]
+
+
+def ordered_stages(state: UiState) -> "list[StageState]":
+    """The stages present in `state`, in STAGE_ORDER — an absent stage (e.g. the
+    launch stage when the terminal was already running) is simply skipped."""
+    return [state.stages[name] for name in STAGE_ORDER if name in state.stages]
+
+
+def _settle_in_progress(stages: "dict[str, StageState]", status: str) -> "dict[str, StageState]":
+    """A copy of `stages` with every still-in-progress stage turned into `status`."""
+    return {
+        name: (replace(s, status=status) if s.status == STAGE_IN_PROGRESS else s)
+        for name, s in stages.items()
+    }
 
 
 def _row_key(mt_login: Optional[str], account_id: Optional[str]) -> str:
@@ -318,19 +514,27 @@ def reduce(state: UiState, event: Event) -> UiState:
     """
     The one place every screen transition and row update happens. Pure: never
     mutates `state` or anything inside it, always returns a brand new `UiState`.
+
+    Every branch is written as `dataclasses.replace(state, ...)` naming only the
+    fields that branch changes, so a field added to `UiState` later carries through
+    every existing transition unchanged instead of being silently reset. The
+    `rows=dict(state.rows)` copies are kept deliberately: the new state never shares
+    a mutable dict with the old one.
     """
     if isinstance(event, AccountProgressEvent):
         if event.phase == PHASE_TERMINAL_CHECK:
             notices = state.notices
             if event.pre_existing_session is not None:
                 notices = notices | {NOTICE_TERMINAL_SWITCHED}
-            return UiState(
+            return replace(
+                state,
                 screen=SCREEN_RUNNING,
                 rows={},
                 notices=notices,
                 pairing_error=None,
                 rate_limit_retry_after_seconds=None,
                 refresh_disabled=True,
+                run_error=None,
             )
 
         key = _row_key(event.mt_login, event.account_id)
@@ -342,37 +546,19 @@ def reduce(state: UiState, event: Event) -> UiState:
             error_reason=event.error_reason,
             account_id=event.account_id,
         )
-        return UiState(
-            screen=state.screen,
-            rows=rows,
-            notices=state.notices,
-            pairing_error=state.pairing_error,
-            rate_limit_retry_after_seconds=state.rate_limit_retry_after_seconds,
-            refresh_disabled=state.refresh_disabled,
-        )
+        return replace(state, rows=rows)
 
     if isinstance(event, PairingSucceededEvent):
-        return UiState(
-            screen=SCREEN_READY,
-            rows=dict(state.rows),
-            notices=state.notices,
-            pairing_error=None,
-            rate_limit_retry_after_seconds=state.rate_limit_retry_after_seconds,
-            refresh_disabled=state.refresh_disabled,
-        )
+        return replace(state, screen=SCREEN_READY, rows=dict(state.rows), pairing_error=None)
 
     if isinstance(event, PairingFailedEvent):
-        return UiState(
-            screen=SCREEN_PAIRING,
-            rows=dict(state.rows),
-            notices=state.notices,
-            pairing_error=event.reason,
-            rate_limit_retry_after_seconds=state.rate_limit_retry_after_seconds,
-            refresh_disabled=state.refresh_disabled,
+        return replace(
+            state, screen=SCREEN_PAIRING, rows=dict(state.rows), pairing_error=event.reason
         )
 
     if isinstance(event, UnauthorizedEvent):
-        return UiState(
+        return replace(
+            state,
             screen=SCREEN_PAIRING,
             rows=dict(state.rows),
             notices=state.notices | {NOTICE_TOKEN_REVOKED},
@@ -382,32 +568,32 @@ def reduce(state: UiState, event: Event) -> UiState:
         )
 
     if isinstance(event, RateLimitedEvent):
-        return UiState(
-            screen=state.screen,
+        return replace(
+            state,
             rows=dict(state.rows),
-            notices=state.notices,
-            pairing_error=state.pairing_error,
             rate_limit_retry_after_seconds=event.retry_after_seconds,
-            refresh_disabled=state.refresh_disabled,
         )
 
     if isinstance(event, RunFinishedEvent):
         screen = SCREEN_READY if state.screen == SCREEN_RUNNING else state.screen
-        return UiState(
+        last_success_label = state.last_success_label
+        if event.succeeded > 0 and event.finished_at_label:
+            last_success_label = event.finished_at_label
+        return replace(
+            state,
             screen=screen,
             rows=dict(state.rows),
-            notices=state.notices,
-            pairing_error=state.pairing_error,
-            rate_limit_retry_after_seconds=state.rate_limit_retry_after_seconds,
             refresh_disabled=False,
+            cancel_requested=False,
+            last_success_label=last_success_label,
         )
 
     if isinstance(event, TerminalNotFoundEvent):
-        return UiState(
+        return replace(
+            state,
             screen=SCREEN_NO_TERMINAL,
             rows=dict(state.rows),
             notices=state.notices | {NOTICE_NO_TERMINAL},
-            pairing_error=state.pairing_error,
             rate_limit_retry_after_seconds=None,
             refresh_disabled=True,
         )
@@ -418,13 +604,72 @@ def reduce(state: UiState, event: Event) -> UiState:
         # that refuses this build outright; the screen itself is left exactly as it
         # was, matching the "notices only ever grow" convention every other pinned
         # notice in this module already follows.
-        return UiState(
-            screen=state.screen,
+        return replace(
+            state,
             rows=dict(state.rows),
             notices=state.notices | {NOTICE_PROTOCOL_TOO_OLD},
-            pairing_error=state.pairing_error,
-            rate_limit_retry_after_seconds=state.rate_limit_retry_after_seconds,
             refresh_disabled=True,
+        )
+
+    if isinstance(event, RunFailedEvent):
+        screen = SCREEN_READY if state.screen == SCREEN_RUNNING else state.screen
+        return replace(
+            state,
+            screen=screen,
+            rows=dict(state.rows),
+            stages=_settle_in_progress(state.stages, STAGE_FAILED),
+            refresh_disabled=False,
+            cancel_requested=False,
+            run_error=run_error_text(
+                event.kind,
+                elevation_mismatch=event.elevation_mismatch,
+                waited_seconds=event.waited_seconds,
+            ),
+        )
+
+    if isinstance(event, RunStartedEvent):
+        # Only the ready/running screen becomes "running"; a run started from any
+        # other screen (a periodic tick after a revoked token, say) must not hide it.
+        screen = SCREEN_RUNNING if state.screen in (SCREEN_READY, SCREEN_RUNNING) else state.screen
+        return replace(
+            state,
+            screen=screen,
+            rows={},
+            stages={},
+            pairing_error=None,
+            rate_limit_retry_after_seconds=None,
+            refresh_disabled=True,
+            cancel_requested=False,
+            run_error=None,
+        )
+
+    if isinstance(event, StageProgressEvent):
+        previous = state.stages.get(event.stage)
+        detail = event.detail
+        elapsed = event.elapsed_seconds
+        if previous is not None:
+            detail = detail if detail is not None else previous.detail
+            elapsed = elapsed if elapsed is not None else previous.elapsed_seconds
+        stages = dict(state.stages)
+        stages[event.stage] = StageState(
+            stage=event.stage, status=event.status, detail=detail, elapsed_seconds=elapsed
+        )
+        return replace(state, stages=stages)
+
+    if isinstance(event, CancelRequestedEvent):
+        if state.screen != SCREEN_RUNNING:
+            return state
+        return replace(state, cancel_requested=True)
+
+    if isinstance(event, RunCancelledEvent):
+        screen = SCREEN_READY if state.screen == SCREEN_RUNNING else state.screen
+        return replace(
+            state,
+            screen=screen,
+            rows=dict(state.rows),
+            stages=_settle_in_progress(state.stages, STAGE_CANCELLED),
+            refresh_disabled=False,
+            cancel_requested=False,
         )
 
     raise TypeError(f"reduce() received an unknown event type: {type(event)!r}")

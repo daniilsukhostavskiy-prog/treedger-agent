@@ -79,11 +79,25 @@ as a security boundary).
 """
 from __future__ import annotations
 
+import logging
+import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from agent import api_client, config_store, errors, mt5_bridge, positions
+from agent import (
+    api_client,
+    config_store,
+    errors,
+    mt5_bridge,
+    positions,
+    terminal_discovery,
+    terminal_process,
+)
+from agent.terminal_discovery import TerminalNotFoundError
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Progress reporting — a plain, GUI-free dataclass. No tkinter import anywhere in
@@ -131,6 +145,43 @@ class RunSummary:
 
 ReportFn = Callable[[AccountProgress], None]
 
+# ---------------------------------------------------------------------------
+# Run stages — the window's stage list («Поиск терминала», «Запуск терминала»,
+# «Подключение к терминалу», «Получение списка счетов»). Reported through the
+# optional `report_stage` callback; `agent/ui_state.py` mirrors these strings.
+# ---------------------------------------------------------------------------
+
+STAGE_FIND_TERMINAL = "find_terminal"
+STAGE_LAUNCH_TERMINAL = "launch_terminal"
+STAGE_CONNECT = "connect"
+STAGE_FETCH_ACCOUNTS = "fetch_accounts"
+
+STAGE_IN_PROGRESS = "in_progress"
+STAGE_DONE = "done"
+STAGE_FAILED = "failed"
+
+
+@dataclass
+class StageProgress:
+    """One stage update. `detail` is the found path, «запущен свёрнутым», or the
+    account count; `elapsed_seconds` is the live connect counter."""
+
+    stage: str
+    status: str
+    detail: Optional[str] = None
+    elapsed_seconds: Optional[int] = None
+
+
+StageFn = Callable[[StageProgress], None]
+
+
+class SyncCancelledError(Exception):
+    """
+    The person pressed «Отменить». Raised by `run_sync` at the next step boundary —
+    never in the middle of a step: a blocking MT5 call cannot be interrupted (only the
+    connect watchdog bounds it), so cancel takes effect only between steps.
+    """
+
 
 class SyncAbortedError(Exception):
     """
@@ -140,6 +191,15 @@ class SyncAbortedError(Exception):
     that is the "no terminal installed at all" case the GUI's own no-terminal screen
     catches). This is the DISTINCT "a path was found but the terminal itself refused
     to start" case.
+    """
+
+
+class TerminalLaunchError(SyncAbortedError):
+    """
+    No terminal64.exe was running, so this program tried to start the discovered one
+    (minimized, see `agent/terminal_process.py`) and Windows refused (`OSError`).
+    A subclass of `SyncAbortedError` so any caller that only knows the parent still
+    treats it as "the run could not reach a terminal".
     """
 
 
@@ -277,6 +337,7 @@ def sync_one_account(client: api_client.ApiClient, account: dict, report: Report
     investor_password = account.get("investorPassword")
 
     def _fail(outcome: str, reason: str, mt_login_label: Optional[str]) -> str:
+        logger.warning("account mt_login=%s failed: outcome=%s reason=%s", mt_login_label, outcome, reason)
         report(
             AccountProgress(
                 account_id=account_id,
@@ -314,6 +375,7 @@ def sync_one_account(client: api_client.ApiClient, account: dict, report: Report
         if not isinstance(broker_server, str) or not broker_server.strip():
             return _fail(errors.OUTCOME_INTERNAL, "broker_server is missing or malformed", str(mt_login))
 
+        logger.info("account mt_login=%d broker_server=%s: login", mt_login, broker_server)
         report(AccountProgress(account_id=account_id, mt_login=str(mt_login), phase=PHASE_LOGIN))
 
         login_ok = mt5_bridge.login_account(mt_login, investor_password, broker_server)
@@ -423,6 +485,7 @@ def sync_one_account(client: api_client.ApiClient, account: dict, report: Report
                 outcome=errors.OUTCOME_OK,
             )
         )
+        logger.info("account mt_login=%d: ok, %d trade(s) sent", mt_login, len(trades_payload))
         return errors.OUTCOME_OK
 
     except Exception as exc:  # noqa: BLE001 — criterion 8: never let one account raise past this function
@@ -438,22 +501,110 @@ def sync_one_account(client: api_client.ApiClient, account: dict, report: Report
 # Whole-run orchestration
 # ---------------------------------------------------------------------------
 
-def run_sync(client: api_client.ApiClient, report: ReportFn) -> RunSummary:
+def run_sync(
+    client: api_client.ApiClient,
+    report: ReportFn,
+    *,
+    report_stage: Optional[StageFn] = None,
+    cancel_event: Optional[threading.Event] = None,
+) -> RunSummary:
     """
-    Run one full sync: initialise the terminal, check for a pre-existing session,
-    fetch this run's account list (persisting the rotated token IMMEDIATELY),
-    then walk every account sequentially via `sync_one_account` — which never raises,
-    so one account's failure can never stop the loop over the rest.
+    Run one full sync: find the terminal, start it if none is running, connect,
+    check for a pre-existing session, fetch this run's account list (persisting the
+    rotated token IMMEDIATELY), then walk every account sequentially via
+    `sync_one_account` — which never raises, so one account's failure can never stop
+    the loop over the rest.
 
-    `agent.terminal_discovery.TerminalNotFoundError` (raised by
-    `mt5_bridge.initialize_terminal()` itself when no terminal is installed anywhere
-    on this machine) is NOT caught here — it propagates to the caller, whose
-    no-terminal screen is the one place that handles it. `SyncAbortedError` is raised
-    instead for the DISTINCT case where a terminal path was found but the terminal
-    itself failed to initialise.
+    `agent.terminal_discovery.TerminalNotFoundError` (raised here, before anything
+    else, when no terminal is installed anywhere on this machine) is NOT caught here —
+    it propagates to the caller, whose no-terminal screen is the one place that handles
+    it. `SyncAbortedError` is raised instead for the DISTINCT case where a terminal path
+    was found but the terminal itself failed to initialise.
+
+    Before connecting: list running terminal64.exe processes, and — ONLY when that list
+    is verifiably empty — start the discovered terminal minimized. A running terminal,
+    or an enumeration that could not tell (`None`), launches nothing. A refused launch
+    raises `TerminalLaunchError`. `mt5_bridge.TerminalUnresponsiveError` from the
+    connect watchdog propagates, with `elevation_mismatch` set when a running terminal
+    is elevated and this process is not.
+
+    `report_stage` (optional) receives a `StageProgress` for each stage's start, end
+    or failure, plus about one CONNECT tick per second while the connect is in
+    progress. `cancel_event` (optional) is checked BETWEEN steps only — after finding
+    the terminal, after launching it, after connecting, after fetching the account list
+    (the rotated token is already saved by then), and before each account — and raises
+    `SyncCancelledError`. A blocking MT5 call cannot be interrupted; only the connect
+    watchdog bounds it, so «Отменить» takes effect after the current step. Both
+    parameters are optional so every existing caller works unchanged.
     """
-    if not mt5_bridge.initialize_terminal():
+
+    def _stage(stage: str, status: str, detail: Optional[str] = None, elapsed: Optional[int] = None) -> None:
+        if report_stage is not None:
+            report_stage(StageProgress(stage, status, detail=detail, elapsed_seconds=elapsed))
+
+    def _check_cancel(where: str) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info("run_sync: cancelled by the user after %s", where)
+            raise SyncCancelledError(f"cancelled after {where}")
+
+    # --- find ---------------------------------------------------------------
+    _stage(STAGE_FIND_TERMINAL, STAGE_IN_PROGRESS)
+    path = terminal_discovery.find_terminal_path()
+    if path is None:
+        _stage(STAGE_FIND_TERMINAL, STAGE_FAILED)
+        raise TerminalNotFoundError("MetaTrader 5 не найден на этом компьютере")
+    logger.info("run_sync: terminal path %s", path)
+    _stage(STAGE_FIND_TERMINAL, STAGE_DONE, detail=path)
+    _check_cancel("finding the terminal")
+
+    running = terminal_process.list_terminal_processes()
+    self_elevated = terminal_process.current_process_elevated()
+    _log_running_terminals(running, path, self_elevated)
+
+    # --- launch (only when verifiably none is running) ----------------------
+    if running == []:
+        _stage(STAGE_LAUNCH_TERMINAL, STAGE_IN_PROGRESS)
+        try:
+            pid = terminal_process.launch_terminal_minimized(path)
+        except OSError as exc:
+            logger.error("run_sync: starting MetaTrader 5 failed: %s", exc)
+            _stage(STAGE_LAUNCH_TERMINAL, STAGE_FAILED)
+            raise TerminalLaunchError("MetaTrader 5 could not be started") from exc
+        logger.info("run_sync: no terminal64.exe was running; started pid=%d minimized", pid)
+        _stage(STAGE_LAUNCH_TERMINAL, STAGE_DONE, detail="запущен свёрнутым")
+        _check_cancel("starting the terminal")
+
+    # --- connect --------------------------------------------------------------
+    _stage(STAGE_CONNECT, STAGE_IN_PROGRESS, elapsed=0)
+    on_tick: Optional[Callable[[int], None]] = None
+    if report_stage is not None:
+        def on_tick(seconds: int) -> None:
+            report_stage(StageProgress(STAGE_CONNECT, STAGE_IN_PROGRESS, elapsed_seconds=seconds))
+
+    try:
+        if on_tick is not None:
+            initialized = mt5_bridge.initialize_terminal(path, on_tick=on_tick)
+        else:
+            initialized = mt5_bridge.initialize_terminal(path)
+    except mt5_bridge.TerminalUnresponsiveError as exc:
+        exc.elevation_mismatch = self_elevated is False and any(
+            t.elevated is True for t in (running or [])
+        )
+        logger.error(
+            "run_sync: terminal unresponsive (waited=%s s, still_blocked=%s, "
+            "elevation_mismatch=%s)",
+            exc.waited_seconds, exc.still_blocked_from_previous, exc.elevation_mismatch,
+        )
+        _stage(STAGE_CONNECT, STAGE_FAILED)
+        raise
+    except Exception:
+        _stage(STAGE_CONNECT, STAGE_FAILED)
+        raise
+    if not initialized:
+        _stage(STAGE_CONNECT, STAGE_FAILED)
         raise SyncAbortedError("MetaTrader 5 terminal failed to initialize")
+    _stage(STAGE_CONNECT, STAGE_DONE)
+    _check_cancel("connecting to the terminal")
 
     # Read whatever account is ALREADY logged in, before this program logs
     # into anything itself. No login restore, no second terminal instance — only a
@@ -468,19 +619,63 @@ def run_sync(client: api_client.ApiClient, report: ReportFn) -> RunSummary:
         )
     )
 
-    fetch_result = client.fetch_accounts()
+    # --- fetch ----------------------------------------------------------------
+    _stage(STAGE_FETCH_ACCOUNTS, STAGE_IN_PROGRESS)
+    try:
+        fetch_result = client.fetch_accounts()
+    except Exception:
+        _stage(STAGE_FETCH_ACCOUNTS, STAGE_FAILED)
+        raise
     # Persist the rotated token IMMEDIATELY — the server has already rotated by the
     # time fetch_accounts() returns, and a crash between the two is exactly what the
     # server's grace window (see agent/api_client.py's AccountsFetchResult docstring)
-    # exists to survive.
+    # exists to survive. This also happens BEFORE any cancel check, so a cancelled run
+    # never loses the rotated token.
     config_store.save_token(fetch_result.token)
+    # Counts only — never the account dicts (they carry the investor password).
+    logger.info("run_sync: server returned %d account(s)", len(fetch_result.accounts))
+    _stage(STAGE_FETCH_ACCOUNTS, STAGE_DONE, detail=str(len(fetch_result.accounts)))
+    _check_cancel("fetching the account list")
 
     summary = RunSummary(total=len(fetch_result.accounts))
     for account in fetch_result.accounts:
+        _check_cancel("the previous account")
         outcome = sync_one_account(client, account, report)
         if outcome == errors.OUTCOME_OK:
             summary.succeeded += 1
         else:
             summary.failed += 1
 
+    logger.info(
+        "run_sync: finished total=%d succeeded=%d failed=%d",
+        summary.total, summary.succeeded, summary.failed,
+    )
     return summary
+
+
+def _log_running_terminals(
+    running: "Optional[list[terminal_process.RunningTerminal]]",
+    discovered_path: str,
+    self_elevated: Optional[bool],
+) -> None:
+    """Diagnostics only: which terminal64.exe processes exist, whether each is the
+    discovered install, and elevation on both sides (an elevated terminal cannot be
+    attached to from a non-elevated process)."""
+    if running is None:
+        logger.warning("run_sync: could not enumerate processes (unknown) — nothing will be launched")
+    elif not running:
+        logger.info("run_sync: terminal64.exe already running: no")
+    else:
+        logger.info("run_sync: terminal64.exe already running: yes (%d)", len(running))
+        wanted = os.path.normcase(os.path.normpath(discovered_path))
+        for t in running:
+            matches = (
+                t.exe_path is not None
+                and os.path.normcase(os.path.normpath(t.exe_path)) == wanted
+            )
+            logger.info(
+                "run_sync: running terminal pid=%d exe_path=%s elevated=%s (%s) "
+                "matches_discovered=%s",
+                t.pid, t.exe_path, t.elevated, t.elevation_source, matches,
+            )
+    logger.info("run_sync: this process elevated=%s", self_elevated)
