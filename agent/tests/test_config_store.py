@@ -63,13 +63,14 @@ def test_save_base_url_then_load_base_url_round_trips() -> None:
     assert config_store.load_base_url() == "https://treedger.com"
 
 
-def test_config_file_contains_exactly_token_and_base_url_keys() -> None:
+def test_config_file_keys_are_a_subset_of_the_allow_list() -> None:
     config_store.save_token("tok_abc123")
     config_store.save_base_url("https://treedger.com")
 
     with config_store.config_path().open("r", encoding="utf-8") as handle:
         data = json.load(handle)
 
+    assert set(data.keys()) <= config_store.ALLOWED_KEYS
     assert set(data.keys()) == {"token", "base_url"}
     # No account, no login, no server name and no password ever lands in here.
     assert "account" not in data
@@ -211,3 +212,89 @@ def test_config_file_still_exactly_two_keys_after_ciphertext_token() -> None:
         data = json.load(handle)
 
     assert set(data.keys()) == {"token", "base_url"}
+
+
+# ---------------------------------------------------------------------------
+# quick 260926-ieo — «Звуки MT5» preference + mute-pending marker (closed
+# allow-list of four keys)
+# ---------------------------------------------------------------------------
+
+
+def test_load_mt5_sounds_muted_defaults_true_on_missing_file() -> None:
+    assert not config_store.config_path().exists()
+    assert config_store.load_mt5_sounds_muted() is True
+
+
+def test_load_mt5_sounds_muted_defaults_true_on_corrupt_file() -> None:
+    path = config_store.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not valid json at all", encoding="utf-8")
+
+    assert config_store.load_mt5_sounds_muted() is True
+
+
+def test_load_mt5_sounds_muted_defaults_true_on_legacy_two_key_file() -> None:
+    config_store.save_token("tok_abc123")
+    config_store.save_base_url("https://treedger.com")
+
+    assert config_store.load_mt5_sounds_muted() is True
+    assert config_store.load_mt5_mute_pending() is False
+
+
+@pytest.mark.parametrize("bad_value", ["no", 0, None])
+def test_load_mt5_sounds_muted_defaults_true_for_non_bool_stored_value(bad_value: object) -> None:
+    path = config_store.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mt5_sounds_muted": bad_value}), encoding="utf-8")
+
+    assert config_store.load_mt5_sounds_muted() is True
+
+
+def test_save_mt5_sounds_muted_round_trips_false() -> None:
+    config_store.save_mt5_sounds_muted(False)
+    assert config_store.load_mt5_sounds_muted() is False
+
+
+def test_load_mt5_mute_pending_defaults_false_and_round_trips_true() -> None:
+    assert config_store.load_mt5_mute_pending() is False
+    config_store.save_mt5_mute_pending(True)
+    assert config_store.load_mt5_mute_pending() is True
+
+
+def test_saving_sound_flags_preserves_ciphertext_token_and_base_url() -> None:
+    config_store.save_token("tok_abc123")
+    config_store.save_base_url("https://treedger.com")
+    config_store.save_mt5_sounds_muted(False)
+    config_store.save_mt5_mute_pending(True)
+
+    assert config_store.load_token() == "tok_abc123"
+    assert config_store.load_base_url() == "https://treedger.com"
+
+
+def test_clear_token_preserves_both_new_sound_keys() -> None:
+    config_store.save_token("tok_abc123")
+    config_store.save_mt5_sounds_muted(False)
+    config_store.save_mt5_mute_pending(True)
+
+    config_store.clear_token()
+
+    assert config_store.load_token() is None
+    assert config_store.load_mt5_sounds_muted() is False
+    assert config_store.load_mt5_mute_pending() is True
+
+
+def test_config_file_holds_exactly_the_allow_list_after_all_four_keys_saved() -> None:
+    config_store.save_token("tok_abc123")
+    config_store.save_base_url("https://treedger.com")
+    config_store.save_mt5_sounds_muted(False)
+    config_store.save_mt5_mute_pending(True)
+
+    with config_store.config_path().open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    assert set(data.keys()) == set(config_store.ALLOWED_KEYS)
+    assert "account" not in data
+    assert "login" not in data
+    assert "server" not in data
+    assert "password" not in data
+    assert "investorPassword" not in data

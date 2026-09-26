@@ -54,6 +54,19 @@ files resolve against.
    The release zip ships the folder as a single top-level `Treedger/` folder (see
    **Release archive layout** below). The shim is not part of the `agent` package and the
    package never imports it.
+   **`agent/assets/treedger.ico`** (added by the owner follow-up to quick 260926-ieo)
+   moves with `agent/` unedited, like everything else in step 2 — it is deliberately
+   NOT under `agent/packaging/`, precisely so its path is the same repo-root-relative
+   string, `agent/assets/treedger.ico`, in both repositories. Both workflows'
+   `NUITKA_FLAGS` reference exactly that path via
+   `--windows-icon-from-ico=agent/assets/treedger.ico`, which EMBEDS the icon into
+   `Treedger.exe`'s own resources at build time — it does not copy the `.ico` file
+   into the shipped `Treedger/` folder, and the frozen program never opens it from
+   disk (`agent/tray.py`'s `TrayIcon` reads the embedded resource instead when
+   `sys.frozen` is True; running from source it loads `agent/assets/treedger.ico`
+   directly). Changing `NUITKA_FLAGS` changes the Nuitka cache key, so the first
+   build after this change is a full cold build (~38 minutes), not the usual
+   incremental one.
 5. Move `agent/.gitignore` to the new repository's root.
 6. Commit once, as the initial commit of the new repository.
 
@@ -65,7 +78,8 @@ treedger-agent/
 ├── packaging/{observe_runtime.ps1, assert_dpapi_executed.py, README.md, root_main.py,
 │              installer/treedger.iss}
 ├── agent/          ← moved whole and unedited: __init__.py, *.py, tests/,
-│                     pytest.ini, requirements.txt, README.md, CHECKLIST-RU.md
+│                     pytest.ini, requirements.txt, README.md, CHECKLIST-RU.md,
+│                     assets/treedger.ico
 ├── main.py         ← packaging/root_main.py, renamed
 └── .gitignore
 ```

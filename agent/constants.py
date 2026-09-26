@@ -18,12 +18,13 @@ autostart checkbox, so the minimized flag keeps changing only the initial window
 state. It is a ONE-SHOT: the hourly timer's own first tick still fires one full
 interval after launch (PKG40-15), it does not move.
 
-WHY THESE LIVE HERE AND NOT AS A THIRD `config.json` KEY
+WHY THESE LIVE HERE AND NOT AS A CONFIG.JSON KEY
 ----------------------------------------------------------------------------------
-`agent/config_store.py`'s own docstring forbids a third key in `config.json` — the
-file holds exactly `token` and `base_url`, on purpose, so no account/login/server/
+`agent/config_store.py`'s own docstring defines a CLOSED allow-list of keys for
+`config.json` — token, base URL, and (since quick 260926-ieo) two program-level
+booleans for the «Звуки MT5» preference — on purpose, so no account/login/server/
 password detail ever accumulates there. A user-editable sync-interval dropdown is
-not worth breaking that rule for: it is a value the program should simply always use
+not worth adding a key for: it is a value the program should simply always use
 correctly, not a setting somebody sets once, forgets about, and later can't explain.
 
 `SYNC_INTERVAL_SECONDS` is also deliberately NOT tied to the autostart checkbox

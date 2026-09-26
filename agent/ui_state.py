@@ -34,7 +34,7 @@ import that would compromise the whole point of this file being pure.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 # ---------------------------------------------------------------------------
 # Screens — exactly the four this window can ever show.
@@ -236,6 +236,120 @@ def run_error_text(
             "„Алготрейдинг“ уже включён — подробности в журнале программы."
         )
     return "Непредвиденная ошибка. Подробности — в журнале программы."
+
+
+# ---------------------------------------------------------------------------
+# Tray status (quick 260926-ieo; two more balloon states added by the same task's
+# owner-decided follow-up) — pure helpers for the tray icon's tooltip and its four
+# balloon triggers. No import beyond `typing.Sequence` — these functions read only
+# `UiState`'s existing public fields/properties; they add nothing to the dataclass, the
+# event union, or `reduce()` itself.
+# ---------------------------------------------------------------------------
+ATTENTION_LOGIN_FAILED = "login_failed"
+ATTENTION_TERMINAL_NOT_FOUND = "terminal_not_found"
+ATTENTION_TOKEN_REVOKED = "token_revoked"
+ATTENTION_ALGO_TRADING_OFF = "algo_trading_off"
+
+
+def attention_kinds(state: UiState, *, login_failed: bool) -> "frozenset[str]":
+    """
+    Which of the four balloon-worthy problems apply to `state` right now — see
+    `attention_balloon` for the text each one produces. `login_failed` is supplied by
+    the caller (`agent/main.py` tracks it per run from the worker's own
+    `_LoginFailedSignal`, per F13) rather than read from `UiState` itself, since
+    `AccountProgressEvent`/`UiState` carry no dedicated "auth failed" field. The other
+    three read directly from `state.screen`/`state.notices`, which is why simply
+    RE-CALLING this function on the current state is enough for the caller's own
+    dedupe (`_evaluate_attention` in `agent/main.py`) to correctly clear a kind the
+    moment the underlying notice clears, and to fire it again on a later relapse — no
+    separate "recovered" event or extra bookkeeping is needed here.
+    """
+    kinds: "set[str]" = set()
+    if state.screen == SCREEN_NO_TERMINAL or NOTICE_NO_TERMINAL in state.notices:
+        kinds.add(ATTENTION_TERMINAL_NOT_FOUND)
+    if login_failed:
+        kinds.add(ATTENTION_LOGIN_FAILED)
+    if NOTICE_TOKEN_REVOKED in state.notices:
+        kinds.add(ATTENTION_TOKEN_REVOKED)
+    if NOTICE_ALGO_TRADING_OFF in state.notices:
+        kinds.add(ATTENTION_ALGO_TRADING_OFF)
+    return frozenset(kinds)
+
+
+def attention_balloon(kind: str, *, mt_logins: "Sequence[str]" = ()) -> "tuple[str, str]":
+    """The `(title, text)` pair for a balloon of kind `kind` — never containing a
+    token, password or money figure, by construction (see each string below). The
+    token-revoked and «Алготрейдинг»-off texts are deliberately worded to match what
+    the window itself already says for those same states (`NOTICE_TEXT`/
+    `_ALGO_TRADING_INSTRUCTION` above), so a person who later opens the window sees
+    consistent wording, not a second, differently-phrased explanation."""
+    if kind == ATTENTION_LOGIN_FAILED:
+        logins = ", ".join(mt_logins) if mt_logins else "?"
+        return (
+            "Treedger: не удалось войти в счёт",
+            (
+                f"MetaTrader 5 не принял вход в счёт {logins}. Проверьте пароль "
+                "инвестора в личном кабинете Treedger. Подробности — в окне программы."
+            ),
+        )
+    if kind == ATTENTION_TERMINAL_NOT_FOUND:
+        return (
+            "Treedger: MetaTrader 5 не найден",
+            f"{NOTICE_TEXT[NOTICE_NO_TERMINAL]} Установите MetaTrader 5 и запустите программу заново.",
+        )
+    if kind == ATTENTION_TOKEN_REVOKED:
+        return (
+            "Treedger: токен отозван",
+            (
+                "Агент отключён от Treedger — токен был отозван. Откройте окно "
+                "программы и привяжите её заново кодом с сайта."
+            ),
+        )
+    if kind == ATTENTION_ALGO_TRADING_OFF:
+        return ("Treedger: «Алготрейдинг» выключен", _ALGO_TRADING_INSTRUCTION)
+    return ("Treedger", "")
+
+
+def tray_tooltip_text(state: UiState) -> str:
+    """
+    The tray icon's tooltip — always starts with "Treedger", at most 127 characters
+    (Windows' own `NOTIFYICONDATAW.szTip` limit), and picks exactly ONE status line by
+    priority (highest first): a too-old build, an unfinished pairing, a missing
+    terminal, an in-progress sync, the last whole-run failure, «Алготрейдинг» off, a
+    per-account failure count, the last success time, or — when nothing else applies —
+    "waiting for the first sync". Never contains a token or `pairing_error`'s raw text
+    (which may itself echo untrusted server content) — only the fixed strings below.
+    """
+    if NOTICE_PROTOCOL_TOO_OLD in state.notices:
+        line = "Программа устарела — скачайте новую версию"
+    elif state.screen == SCREEN_PAIRING:
+        line = "Нужна привязка — откройте окно"
+    elif state.screen == SCREEN_NO_TERMINAL or NOTICE_NO_TERMINAL in state.notices:
+        line = "MetaTrader 5 не найден"
+    elif state.screen == SCREEN_RUNNING:
+        line = "Синхронизация…"
+    elif state.run_error:
+        line = "Ошибка синхронизации — откройте окно"
+    elif NOTICE_ALGO_TRADING_OFF in state.notices:
+        line = 'Включите „Алготрейдинг“ в MetaTrader 5'
+    elif state.failed_count > 0:
+        line = f"Ошибки по счетам: {state.failed_count} — откройте окно"
+    elif state.last_success_label:
+        line = f"Последняя синхронизация: {state.last_success_label}"
+    else:
+        line = "Ожидание первой синхронизации"
+    return _clamp_tooltip(f"Treedger: {line}")
+
+
+def _clamp_tooltip(text: str, limit: int = 127) -> str:
+    """Mirrors `agent/tray.py`'s own `clamp_text`/`TOOLTIP_MAX_CHARS` (127) — kept as a
+    small private copy rather than an import, since this module deliberately imports
+    no GUI toolkit or sibling Windows module (see this file's own header docstring)."""
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return text[:limit]
+    return text[: limit - 1] + "…"
 
 
 # ---------------------------------------------------------------------------

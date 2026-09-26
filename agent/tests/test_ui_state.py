@@ -855,3 +855,174 @@ def test_stage_strings_mirror_sync_module() -> None:
         "STAGE_IN_PROGRESS", "STAGE_DONE", "STAGE_FAILED",
     ):
         assert getattr(ui_state, name) == getattr(sync, name)
+
+
+# ---------------------------------------------------------------------------
+# quick 260926-ieo — tray status: tooltip priority, attention kinds, balloons
+# ---------------------------------------------------------------------------
+
+
+def _ready() -> "ui_state.UiState":
+    return ui_state.UiState(screen=ui_state.SCREEN_READY)
+
+
+def test_tooltip_always_starts_with_treedger_and_is_at_most_127_chars() -> None:
+    text = ui_state.tray_tooltip_text(_ready())
+    assert text.startswith("Treedger")
+    assert len(text) <= 127
+
+
+def test_tooltip_priority_1_protocol_too_old() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY, notices=frozenset({ui_state.NOTICE_PROTOCOL_TOO_OLD}))
+    assert ui_state.tray_tooltip_text(state) == "Treedger: Программа устарела — скачайте новую версию"
+
+
+def test_tooltip_priority_2_pairing() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_PAIRING)
+    assert ui_state.tray_tooltip_text(state) == "Treedger: Нужна привязка — откройте окно"
+
+
+def test_tooltip_priority_3_no_terminal() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_NO_TERMINAL)
+    assert ui_state.tray_tooltip_text(state) == "Treedger: MetaTrader 5 не найден"
+
+
+def test_tooltip_priority_3_no_terminal_via_notice_even_on_ready_screen() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY, notices=frozenset({ui_state.NOTICE_NO_TERMINAL}))
+    assert ui_state.tray_tooltip_text(state) == "Treedger: MetaTrader 5 не найден"
+
+
+def test_tooltip_priority_4_running() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_RUNNING)
+    assert ui_state.tray_tooltip_text(state) == "Treedger: Синхронизация…"
+
+
+def test_tooltip_priority_5_run_error() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY, run_error="что-то пошло не так")
+    assert ui_state.tray_tooltip_text(state) == "Treedger: Ошибка синхронизации — откройте окно"
+
+
+def test_tooltip_priority_6_algo_trading_off() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY, notices=frozenset({ui_state.NOTICE_ALGO_TRADING_OFF}))
+    assert "Алготрейдинг" in ui_state.tray_tooltip_text(state)
+
+
+def test_tooltip_priority_7_failed_count() -> None:
+    state = ui_state.UiState(
+        screen=ui_state.SCREEN_READY,
+        rows={"1": ui_state.AccountRowState(mt_login="1", phase=ui_state.PHASE_FAILED)},
+    )
+    assert ui_state.tray_tooltip_text(state) == "Treedger: Ошибки по счетам: 1 — откройте окно"
+
+
+def test_tooltip_priority_8_last_success_label() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY, last_success_label="24.09.2026 10:00")
+    assert ui_state.tray_tooltip_text(state) == "Treedger: Последняя синхронизация: 24.09.2026 10:00"
+
+
+def test_tooltip_priority_9_otherwise_waiting() -> None:
+    assert ui_state.tray_tooltip_text(_ready()) == "Treedger: Ожидание первой синхронизации"
+
+
+def test_tooltip_never_contains_a_secret_looking_pairing_error() -> None:
+    secret = "tok_super_secret_value_12345"
+    state = ui_state.UiState(screen=ui_state.SCREEN_PAIRING, pairing_error=secret)
+    assert secret not in ui_state.tray_tooltip_text(state)
+
+
+def test_attention_kinds_terminal_not_found_from_screen() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_NO_TERMINAL)
+    assert ui_state.ATTENTION_TERMINAL_NOT_FOUND in ui_state.attention_kinds(state, login_failed=False)
+
+
+def test_attention_kinds_terminal_not_found_from_notice() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY, notices=frozenset({ui_state.NOTICE_NO_TERMINAL}))
+    assert ui_state.ATTENTION_TERMINAL_NOT_FOUND in ui_state.attention_kinds(state, login_failed=False)
+
+
+def test_attention_kinds_login_failed_flag() -> None:
+    state = _ready()
+    kinds = ui_state.attention_kinds(state, login_failed=True)
+    assert ui_state.ATTENTION_LOGIN_FAILED in kinds
+    assert ui_state.ATTENTION_TERMINAL_NOT_FOUND not in kinds
+
+
+def test_attention_kinds_empty_when_nothing_applies() -> None:
+    assert ui_state.attention_kinds(_ready(), login_failed=False) == frozenset()
+
+
+def test_attention_balloon_login_failed_names_both_logins_and_stays_within_limits() -> None:
+    title, text = ui_state.attention_balloon(ui_state.ATTENTION_LOGIN_FAILED, mt_logins=["123", "456"])
+    assert len(title) <= 63
+    assert len(text) <= 255
+    assert "123" in text
+    assert "456" in text
+    assert "tok_" not in text  # no token ever appears in a balloon
+
+
+def test_attention_balloon_terminal_not_found_reuses_notice_text() -> None:
+    title, text = ui_state.attention_balloon(ui_state.ATTENTION_TERMINAL_NOT_FOUND)
+    assert ui_state.NOTICE_TEXT[ui_state.NOTICE_NO_TERMINAL] in text
+    assert len(title) <= 63
+    assert len(text) <= 255
+
+
+# ---------------------------------------------------------------------------
+# Owner follow-up to quick 260926-ieo — two more balloon states: token revoked,
+# «Алготрейдинг» off.
+# ---------------------------------------------------------------------------
+
+
+def test_attention_kinds_token_revoked_from_notice() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_PAIRING, notices=frozenset({ui_state.NOTICE_TOKEN_REVOKED}))
+    assert ui_state.ATTENTION_TOKEN_REVOKED in ui_state.attention_kinds(state, login_failed=False)
+
+
+def test_attention_kinds_algo_trading_off_from_notice() -> None:
+    state = ui_state.UiState(screen=ui_state.SCREEN_READY, notices=frozenset({ui_state.NOTICE_ALGO_TRADING_OFF}))
+    assert ui_state.ATTENTION_ALGO_TRADING_OFF in ui_state.attention_kinds(state, login_failed=False)
+
+
+def test_attention_kinds_all_four_can_combine() -> None:
+    state = ui_state.UiState(
+        screen=ui_state.SCREEN_NO_TERMINAL,
+        notices=frozenset({ui_state.NOTICE_TOKEN_REVOKED, ui_state.NOTICE_ALGO_TRADING_OFF}),
+    )
+    kinds = ui_state.attention_kinds(state, login_failed=True)
+    assert kinds == frozenset(
+        {
+            ui_state.ATTENTION_TERMINAL_NOT_FOUND,
+            ui_state.ATTENTION_LOGIN_FAILED,
+            ui_state.ATTENTION_TOKEN_REVOKED,
+            ui_state.ATTENTION_ALGO_TRADING_OFF,
+        }
+    )
+
+
+def test_attention_balloon_token_revoked_names_no_secret_and_stays_within_limits() -> None:
+    title, text = ui_state.attention_balloon(ui_state.ATTENTION_TOKEN_REVOKED)
+    assert len(title) <= 63
+    assert len(text) <= 255
+    assert "tok_" not in text
+    assert "привяж" in text or "привязк" in text  # actionable, tells the person what to do
+
+
+def test_attention_balloon_algo_trading_off_reuses_the_window_instruction() -> None:
+    title, text = ui_state.attention_balloon(ui_state.ATTENTION_ALGO_TRADING_OFF)
+    assert text == ui_state.NOTICE_TEXT[ui_state.NOTICE_ALGO_TRADING_OFF]
+    assert len(title) <= 63
+    assert len(text) <= 255
+
+
+def test_module_imports_no_gui_toolkit_still_passes_after_tray_status_additions() -> None:
+    import ast
+    import pathlib
+
+    source_path = pathlib.Path(__file__).resolve().parent.parent / "ui_state.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert alias.name != "tkinter"
+        elif isinstance(node, ast.ImportFrom):
+            assert node.module != "tkinter"

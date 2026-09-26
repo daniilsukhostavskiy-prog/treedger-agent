@@ -50,6 +50,12 @@ class _FakeUser32:
     A stand-in for the real `ctypes.WinDLL("user32", ...)` handle, injected via
     monkeypatch.
 
+    By default (`tray_window_found=False`) `FindWindowW(TRAY_WINDOW_CLASS, None)`
+    returns 0, so `raise_existing_window()` falls through to the title-based path this
+    class already exercised before quick 260926-ieo added the tray-window path in
+    front of it — every pre-existing test in this file therefore keeps exercising
+    exactly the title-based fallback, unchanged.
+
     Does NOT cover: real Windows foreground-lock behaviour — whether
     `SetForegroundWindow` actually succeeds from a background process on a live,
     interactive desktop session (LIKELY but not proven in
@@ -64,22 +70,58 @@ class _FakeUser32:
         foreground_thread_id: int = 222,
         attach_succeeds: bool = True,
         set_foreground_succeeds: bool = True,
+        tray_window_found: bool = False,
+        tray_hwnd: int = 7777,
+        register_message_succeeds: bool = True,
+        allow_set_foreground_raises: bool = False,
+        post_message_succeeds: bool = True,
+        window_thread_pid: int = 4321,
     ) -> None:
         self.window_found = window_found
         self.foreground_thread_id = foreground_thread_id
         self.attach_succeeds = attach_succeeds
         self.set_foreground_succeeds = set_foreground_succeeds
+        self.tray_window_found = tray_window_found
+        self.tray_hwnd = tray_hwnd
+        self.register_message_succeeds = register_message_succeeds
+        self.allow_set_foreground_raises = allow_set_foreground_raises
+        self.post_message_succeeds = post_message_succeeds
+        self.window_thread_pid = window_thread_pid
         self.attach_calls: list[tuple[int, int, bool]] = []
+        self.register_window_message_calls: list[str] = []
+        self.post_message_calls: list[tuple[int, int]] = []
+        self.allow_set_foreground_calls: list[int] = []
 
-    def FindWindowW(self, _class_name: object, title: str) -> int:
+    def FindWindowW(self, class_name: object, title: object) -> int:
+        if class_name is not None:
+            # The tray-window lookup (quick 260926-ieo): by class name, no title.
+            return self.tray_hwnd if self.tray_window_found else 0
         assert title == single_instance.WINDOW_TITLE
         return 9999 if self.window_found else 0
 
+    def RegisterWindowMessageW(self, name: str) -> int:
+        self.register_window_message_calls.append(name)
+        return 555 if self.register_message_succeeds else 0
+
+    def GetWindowThreadProcessId(self, _hwnd: int, pid_out: object) -> int:
+        if pid_out is not None:
+            # `ctypes.byref(wintypes.DWORD(...))` on the real path — write through it
+            # exactly like the real Win32 call would.
+            pid_out._obj.value = self.window_thread_pid
+        return self.foreground_thread_id
+
+    def AllowSetForegroundWindow(self, pid: int) -> bool:
+        if self.allow_set_foreground_raises:
+            raise OSError("simulated AllowSetForegroundWindow failure")
+        self.allow_set_foreground_calls.append(pid)
+        return True
+
+    def PostMessageW(self, hwnd: int, msg_id: int, _wparam: int, _lparam: int) -> bool:
+        self.post_message_calls.append((hwnd, msg_id))
+        return self.post_message_succeeds
+
     def GetForegroundWindow(self) -> int:
         return 8888
-
-    def GetWindowThreadProcessId(self, _hwnd: int, _pid_out: object) -> int:
-        return self.foreground_thread_id
 
     def AttachThreadInput(self, current_id: int, target_id: int, attach: bool) -> bool:
         self.attach_calls.append((current_id, target_id, attach))
@@ -116,7 +158,9 @@ def test_acquire_returns_false_on_second_call_while_first_handle_held(
 
 
 # ---------------------------------------------------------------------------
-# raise_existing_window()
+# raise_existing_window() — title-based fallback (no tray window found, i.e.
+# `tray_window_found=False`, the `_FakeUser32` default). These tests all predate quick
+# 260926-ieo's tray-window path and keep their original, unchanged assertions.
 # ---------------------------------------------------------------------------
 
 
@@ -163,6 +207,59 @@ def test_raise_existing_window_never_raises_on_unexpected_api_failure(
     monkeypatch.setattr(single_instance, "_user32", _ExplodingUser32())
 
     assert single_instance.raise_existing_window() is False
+
+
+# ---------------------------------------------------------------------------
+# raise_existing_window() — tray-window path (quick 260926-ieo)
+# ---------------------------------------------------------------------------
+
+
+def test_raise_existing_window_uses_tray_window_when_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(single_instance, "_kernel32", _FakeKernel32())
+    fake_user32 = _FakeUser32(tray_window_found=True)
+    monkeypatch.setattr(single_instance, "_user32", fake_user32)
+
+    assert single_instance.raise_existing_window() is True
+    assert fake_user32.register_window_message_calls == [single_instance.SHOW_WINDOW_MESSAGE_NAME]
+    assert fake_user32.allow_set_foreground_calls == [fake_user32.window_thread_pid]
+    assert fake_user32.post_message_calls == [(fake_user32.tray_hwnd, 555)]
+    # The title-based path must NOT have run.
+    assert fake_user32.attach_calls == []
+
+
+def test_raise_existing_window_tray_path_returns_false_when_post_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(single_instance, "_kernel32", _FakeKernel32())
+    fake_user32 = _FakeUser32(tray_window_found=True, post_message_succeeds=False)
+    monkeypatch.setattr(single_instance, "_user32", fake_user32)
+
+    assert single_instance.raise_existing_window() is False
+    assert fake_user32.attach_calls == []  # never falls back once a tray window exists
+
+
+def test_raise_existing_window_tray_path_returns_false_and_posts_nothing_when_register_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(single_instance, "_kernel32", _FakeKernel32())
+    fake_user32 = _FakeUser32(tray_window_found=True, register_message_succeeds=False)
+    monkeypatch.setattr(single_instance, "_user32", fake_user32)
+
+    assert single_instance.raise_existing_window() is False
+    assert fake_user32.post_message_calls == []
+
+
+def test_raise_existing_window_tray_path_still_posts_when_allow_set_foreground_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(single_instance, "_kernel32", _FakeKernel32())
+    fake_user32 = _FakeUser32(tray_window_found=True, allow_set_foreground_raises=True)
+    monkeypatch.setattr(single_instance, "_user32", fake_user32)
+
+    assert single_instance.raise_existing_window() is True
+    assert fake_user32.post_message_calls == [(fake_user32.tray_hwnd, 555)]
 
 
 # ---------------------------------------------------------------------------

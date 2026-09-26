@@ -22,6 +22,25 @@ visibly did something, and only THEN exit with code 0. That exit-0 wiring itself
 in `agent/main.py` — this module only provides the two
 primitives `main.py` calls before doing anything else.
 
+RAISING A WITHDRAWN WINDOW (quick 260926-ieo)
+--------------------------------------------------------------------------
+Since this quick task, the program normally sits in the notification area with its
+window WITHDRAWN, not merely minimised — and a withdrawn Tk window cannot be reliably
+revived from OUTSIDE the owning process the way a merely-iconified window's title can be
+found and restored. `raise_existing_window()` therefore tries a NEW path first: find the
+first instance's tray hidden window by its fixed class name
+(`agent.tray.TRAY_WINDOW_CLASS`), and post it the registered `SHOW_WINDOW_MESSAGE_NAME`
+message — the first instance's own tray window procedure is what actually calls
+`_show_window()` on receiving that message (see `agent/tray.py` and `agent/main.py`'s
+`_handle_tray_command`), because only code running INSIDE that process can deiconify its
+own withdrawn root. `AllowSetForegroundWindow(pid)` is called with the FIRST instance's
+own process id (read via `GetWindowThreadProcessId` on the tray window) so Windows hands
+that process the foreground right the person's own click on the second instance just
+established — without it, the raised window could come up behind other windows on some
+Windows versions. Only when no tray window can be found (the tray failed to start, or
+this is an older build) does this function fall back to the original title-based
+`AttachThreadInput`/`SetForegroundWindow` sequence below, unchanged.
+
 WHY A NAMED MUTEX, NOT A LOCK FILE
 --------------------------------------------------------------------------
 A Windows kernel mutex is released automatically by the OS the moment the owning
@@ -66,6 +85,8 @@ import ctypes
 from ctypes import wintypes
 from typing import Optional
 
+from agent.tray import SHOW_WINDOW_MESSAGE_NAME, TRAY_WINDOW_CLASS
+
 try:
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -98,6 +119,13 @@ if _user32 is not None:
     _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     _user32.SetForegroundWindow.restype = wintypes.BOOL
     _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    # quick 260926-ieo — the tray-window raise path.
+    _user32.PostMessageW.restype = wintypes.BOOL
+    _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    _user32.RegisterWindowMessageW.restype = wintypes.UINT
+    _user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+    _user32.AllowSetForegroundWindow.restype = wintypes.BOOL
+    _user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
 
 MUTEX_NAME = r"Local\TreedgerAgent-SingleInstance"
 """The kernel object name this program checks and creates. Per-session (`Local\\`), not
@@ -150,15 +178,46 @@ def acquire_single_instance_lock() -> bool:
     return ctypes.get_last_error() != _ERROR_ALREADY_EXISTS
 
 
+def _raise_via_tray_window() -> Optional[bool]:
+    """
+    The tray-window raise path (quick 260926-ieo) — see the module docstring's
+    "RAISING A WITHDRAWN WINDOW" section. Returns `True`/`False` when a tray window WAS
+    found (success/failure of the post), or `None` when no tray window was found at
+    all, so the caller knows to fall back to the title-based path. Never raises.
+    """
+    try:
+        hwnd = _user32.FindWindowW(TRAY_WINDOW_CLASS, None)
+        if not hwnd:
+            return None
+
+        msg_id = _user32.RegisterWindowMessageW(SHOW_WINDOW_MESSAGE_NAME)
+        if not msg_id:
+            return False
+
+        try:
+            pid = wintypes.DWORD(0)
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value:
+                _user32.AllowSetForegroundWindow(pid.value)
+        except Exception:
+            # Best effort only — the message is still posted below either way (see
+            # module docstring: "the message is still posted (best effort)").
+            pass
+
+        return bool(_user32.PostMessageW(hwnd, msg_id, 0, 0))
+    except Exception:
+        return False
+
+
 def raise_existing_window() -> bool:
     """
-    Best-effort: find the first instance's window by its exact title and bring it to
-    the foreground. Returns True only when a window handle was found AND the
-    foreground call itself reported success. NEVER raises — every Windows API failure
-    along this path degrades to False, because a second instance that cannot raise the
-    first instance's window must still exit cleanly; this function's only job is a
-    best effort, and its caller (`agent/main.py`) exits 0 regardless of the
-    return value.
+    Best-effort: bring the first instance's window to the front. Tries the tray-window
+    path first (quick 260926-ieo — see module docstring), and falls back to the
+    original title-based `AttachThreadInput`/`SetForegroundWindow` sequence only when no
+    tray window can be found at all. NEVER raises — every Windows API failure along
+    this path degrades to False, because a second instance that cannot raise the first
+    instance's window must still exit cleanly; this function's only job is a best
+    effort, and its caller (`agent/main.py`) exits 0 regardless of the return value.
 
     Honest caveat — LIKELY, not proven on real hardware yet:
     Windows' foreground-lock restriction means a background process
@@ -171,6 +230,10 @@ def raise_existing_window() -> bool:
     """
     if _kernel32 is None or _user32 is None:
         return False
+
+    tray_result = _raise_via_tray_window()
+    if tray_result is not None:
+        return tray_result
 
     try:
         hwnd = _user32.FindWindowW(None, WINDOW_TITLE)

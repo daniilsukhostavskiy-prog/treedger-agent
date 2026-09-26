@@ -49,9 +49,22 @@ env:
   #   build_output/main.dist (named after the main.py build shim) — that folder is
   #   build-internal; the release zip below ships it as a single top-level Treedger/
   #   folder instead. (--output-folder-name is NOT used: it always appends ".dist".)
+  # Owner follow-up to quick 260926-ieo adds one more flag (must also stay IDENTICAL
+  # to probe-window.yml's NUITKA_FLAGS):
+  # - --windows-icon-from-ico=agent/assets/treedger.ico: EMBEDS this icon (a
+  #   byte-for-byte copy of src/app/favicon.ico, 6 sizes 16..256) into Treedger.exe's
+  #   own resources at build time — it does NOT copy the .ico file onto disk next to
+  #   the built exe, so the running (frozen) program never opens that file itself;
+  #   agent/tray.py's TrayIcon reads this same embedded resource via
+  #   ExtractIconExW(sys.executable, ...) when `sys.frozen` is True. This is the ONLY
+  #   path by which the frozen tray, Explorer, the Start-menu shortcut and the
+  #   taskbar all show the Treedger "T" instead of the generic application icon.
   # Changing this value changes the cache key below; its restore-keys prefix still
-  # restores the previous cache, so the next run is not a full cold 23-minute build.
-  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy --nofollow-import-to=agent.tests --windows-console-mode=disable --output-filename=Treedger.exe"
+  # restores the previous cache, so the next run is not a full cold 23-minute build —
+  # EXCEPT this specific change, which by definition changes NUITKA_FLAGS itself, so
+  # the very next build after this one IS a full cold-cache build (~38 minutes, per
+  # this file's own release-pipeline timing note), not an incremental one.
+  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy --nofollow-import-to=agent.tests --windows-console-mode=disable --output-filename=Treedger.exe --windows-icon-from-ico=agent/assets/treedger.ico"
   # A deliberately invalid bearer token, planted into config.json before the
   # runtime-observation launch below. The program must reach its own
   # authorization-failure path and stop there — this value is never a real

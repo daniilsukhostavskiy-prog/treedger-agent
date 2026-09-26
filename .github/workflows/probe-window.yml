@@ -47,9 +47,15 @@ env:
   #   flag in BOTH workflow files and record #3019 as a confirmed limitation.
   # - --output-filename=Treedger.exe: renames only the binary; the dist folder stays
   #   build_output/main.dist.
+  # Owner follow-up to quick 260926-ieo adds one more flag (must stay IDENTICAL to
+  # build-release.yml's NUITKA_FLAGS — see that file's own comment for the full
+  # explanation of why this embeds rather than ships the icon file):
+  # - --windows-icon-from-ico=agent/assets/treedger.ico
   # Changing this value changes the cache key; its restore-keys prefix still restores
-  # the previous cache, so this is not a full cold build.
-  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy --nofollow-import-to=agent.tests --windows-console-mode=disable --output-filename=Treedger.exe"
+  # the previous cache, so this is not a full cold build — EXCEPT this specific
+  # change, which by definition changes NUITKA_FLAGS itself, so the very next probe
+  # run after this one is a full cold-cache build.
+  NUITKA_FLAGS: "--standalone --enable-plugin=tk-inter --assume-yes-for-downloads --include-package=agent --include-package=numpy --nofollow-import-to=agent.tests --windows-console-mode=disable --output-filename=Treedger.exe --windows-icon-from-ico=agent/assets/treedger.ico"
   # A deliberately invalid bearer token, planted into config.json before every
   # launch below. The program must reach its own authorization-failure path and
   # stop there — this value is never a real token and is never sent anywhere

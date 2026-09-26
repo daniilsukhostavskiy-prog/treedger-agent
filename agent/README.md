@@ -164,20 +164,72 @@ Use the installer if that matters to you.
 
 Code-signing the executable is still deliberately deferred, not forgotten.
 
+## Tray icon and MT5 sounds (quick 260926-ieo)
+
+Since this quick task, autostart (`--minimized`) no longer opens a minimised window at
+all — it opens **no window and no taskbar button**, only a small icon in the Windows
+notification area (the tray, next to the clock). Right-click it for:
+
+| Item | What it does |
+|---|---|
+| **Синхронизировать сейчас** | Starts a sync immediately, exactly like the in-window button. |
+| **Открыть окно** | Brings the program's window up. |
+| **Открыть Treedger** | Opens the site in your browser (your saved server address, or treedger.com). |
+| **Звуки MT5: выкл / вкл** | A checkbox — toggles whether this program mutes MetaTrader 5's own sounds (see below). Off by default (muted). |
+| **Выход** | The ONLY thing that quits the program. |
+
+Left-clicking the icon (or clicking a warning balloon) also brings the window up.
+
+**Closing the window with the X does not quit the program** — it just hides it back to
+the tray; syncing keeps happening on schedule. Only **«Выход»** in the tray menu ends the
+program. The one exception: if the tray icon itself could not be created (rare — see
+below), X quits exactly as it always did, so the program can never be left running with
+neither a window nor a tray icon.
+
+**The tooltip** (hover over the icon) always shows the current status — the last
+successful sync time, "syncing…", or the current problem. A small notification balloon
+appears only for two specific problems, and only while the window is hidden: MetaTrader 5
+refused a login (wrong investor password), or MetaTrader 5 could not be found at all.
+Nothing else ever pops up a balloon — a routine, successful sync is silent, exactly as
+before.
+
+**«Звуки MT5»** — muted by default. While muted, the program periodically (about every
+15 seconds, every 2 seconds during a sync) mutes MetaTrader 5's own sound through
+Windows' own per-application volume mixer — the same mixer you would open yourself
+(right-click the speaker icon → "Open Volume Mixer"). This only ever touches
+`terminal64.exe`'s own entry there: never the master/speaker volume, never any other
+program, and never a MetaTrader 5 setting or file. Turning the tray checkbox off, or
+choosing «Выход», restores MT5's sound — but only the sessions THIS program muted; if
+you had muted MT5 yourself in the volume mixer before turning this preference on, this
+program leaves your own choice alone and never unmutes it.
+
+Two things worth knowing:
+- If you unmute MT5 by hand in the Windows volume mixer while «Звуки MT5: выкл» is still
+  selected, the program mutes it again within about 15 seconds — use the tray checkbox
+  if you want it to stay unmuted.
+- If MetaTrader 5 is not running at the moment you choose «Выход» (or toggle the
+  checkbox off), Windows may still remember the mute for that program's identity; it is
+  restored the next time this program runs with sounds on, or if you unmute it yourself
+  in the volume mixer.
+
+If the tray icon cannot be created at all (Explorer was still starting up at logon, and
+never became ready even after two minutes of retries — rare), the program falls back to
+showing its window instead, exactly as it did before this quick task.
+
 ## Autostart and periodic sync
 
 **Запускать вместе с Windows** (off by default) means exactly one thing: whether the
-program's window opens automatically when you log into Windows. It carries no second
-meaning — it does not change how often the program syncs, and it does not put the program
-into any special "background" mode; a minimised window is the exact same program, just
-iconified.
+program starts automatically when you log into Windows. It carries no second meaning —
+it does not change how often the program syncs.
 
-About 15 seconds after the window opens, the program starts one sync by itself, and then
-syncs once an hour while its window is open — however it was launched, manually or via
-autostart, minimised or not. `--minimized` (what autostart passes) changes only the
-window's initial state. Together that makes the unattended chain: log into Windows → the
-program opens minimised → it syncs ~15 s later, starting MetaTrader 5 minimised if it is
-not running → every hour after that.
+About 15 seconds after the window opens (or the tray icon appears), the program starts
+one sync by itself, and then syncs once an hour after that — however it was launched,
+manually or via autostart, in the tray or with its window open. `--minimized` (what
+autostart passes) changes only the program's initial visibility — see "Tray icon and MT5
+sounds" above for exactly what it now means. Together that makes the unattended chain:
+log into Windows → the program appears only as a tray icon → it syncs ~15 s later,
+starting MetaTrader 5 minimised if it is not running (with its own sounds muted, unless
+you turned that off) → every hour after that.
 
 How it works (quick 260925-qhs): autostart is ONE per-user registry value,
 `TreedgerAgent`, under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, with the data
@@ -223,8 +275,9 @@ on their own machine; one account synced and 5 trades arrived in the journal.
 ## Single instance
 
 If the program is already running and you start it again, the second copy brings the
-first one's window to the front and exits immediately. It never opens a second window and
-never starts a second connection to your MT5 terminal.
+first one's window to the front — even when it currently lives only as a tray icon with
+no window open — and exits immediately. It never opens a second window and never starts a
+second connection to your MT5 terminal.
 
 ### First run, step by step
 
@@ -364,6 +417,9 @@ any keyboard layout (including Russian), and a right-click opens «Выреза�
 ## What this program deliberately does not include
 
 - No code signing (the installer exists since quick 260925-qhs; it is not signed either).
-- No tray icon — the program only ever shows its one window (minimised or not).
 - No support for an account's live open positions — only closed-trade history is read
   and sent.
+- Never hides, minimises or reconfigures the MT5 terminal window; never edits any MT5
+  file or setting — the tray icon and the «Звуки MT5» preference (quick 260926-ieo) only
+  ever touch this program's own window/tray and MetaTrader 5's own Windows audio session,
+  nothing about the terminal itself.

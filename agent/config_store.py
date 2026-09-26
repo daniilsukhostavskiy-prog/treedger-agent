@@ -7,11 +7,23 @@ diagnostic log, in a `logs/` subfolder owned entirely by `agent/diagnostics.py`
 configuration, is never read back by this program, and never contains the bearer
 token, the investor password or the pairing code.
 
-Deliberately trivial, by design: one JSON
-file, exactly two keys, standard-library `json` only. This module is not a general
-key-value store and must never grow a third key.
+Deliberately trivial, by design: one JSON file, standard-library `json` only.
 
-WHY ONLY A TOKEN AND A BASE URL EVER GO IN HERE — READ BEFORE ADDING A THIRD KEY
+CLOSED ALLOW-LIST OF FOUR KEYS (widened by quick 260926-ieo — read before adding a fifth)
+----------------------------------------------------------------------------------
+Until quick 260926-ieo this module held exactly two keys and its own docstring said so
+in the imperative ("must never grow a third key"). The owner then asked, in that quick
+task, for the «Звуки MT5» preference (whether this program mutes the MetaTrader 5
+terminal's Windows audio sessions) to survive a restart — a program-level preference,
+not a per-account fact — so two plain booleans were added: the preference itself
+(`mt5_sounds_muted`) and a marker (`mt5_mute_pending`) meaning "a mute this program
+applied may still be in effect in Windows' per-app volume memory, and should be undone
+even if this run never re-classified it." `ALLOWED_KEYS` below is the WHOLE list, closed
+at four — this module is still not a general key-value store, and the original reason
+the two-key rule existed stands word for word, unchanged: never an account, a login, a
+broker-server name, a password, or anything else about the trader's accounts.
+
+WHY ONLY THESE FOUR VALUES EVER GO IN HERE — READ BEFORE ADDING A FIFTH KEY
 ----------------------------------------------------------------------------------
 The investor password is never written to this file (or anywhere else). It arrives
 fresh, in memory only, on every `/api/agent/accounts` response (decrypted server-side)
@@ -65,9 +77,19 @@ from agent import dpapi
 _APP_DIR_NAME = "TreedgerAgent"
 _CONFIG_FILENAME = "config.json"
 
-# The exact two keys this file is ever allowed to hold. Nothing else, ever.
+# The exact four keys this file is ever allowed to hold — see the module docstring's
+# "CLOSED ALLOW-LIST OF FOUR KEYS" section. Nothing else, ever.
 _KEY_TOKEN = "token"
 _KEY_BASE_URL = "base_url"
+_KEY_MT5_SOUNDS_MUTED = "mt5_sounds_muted"
+_KEY_MT5_MUTE_PENDING = "mt5_mute_pending"
+
+ALLOWED_KEYS: "frozenset[str]" = frozenset(
+    {_KEY_TOKEN, _KEY_BASE_URL, _KEY_MT5_SOUNDS_MUTED, _KEY_MT5_MUTE_PENDING}
+)
+"""The whole, closed set of keys `config.json` is ever allowed to hold — see the module
+docstring's "CLOSED ALLOW-LIST OF FOUR KEYS" section. Never an account, login, broker-server
+name, password or anything else about the trader's accounts."""
 
 
 def _app_data_dir() -> Path:
@@ -89,7 +111,7 @@ def app_data_dir() -> Path:
     """
     Public accessor for the per-user application-data folder (see `_app_data_dir`).
     Used by `agent/diagnostics.py` to place its `logs/` subfolder beside
-    `config.json`. Adds no config key — this module's two-key rule is unchanged.
+    `config.json`. Adds no config key — this module's closed allow-list is unchanged.
     """
     return _app_data_dir()
 
@@ -200,4 +222,43 @@ def save_base_url(url: str) -> None:
     """Persist the server base URL, replacing whatever was stored before."""
     data = _read_config()
     data[_KEY_BASE_URL] = url
+    _write_config(data)
+
+
+def load_mt5_sounds_muted() -> bool:
+    """
+    Whether this program should mute the MetaTrader 5 terminal's Windows audio
+    sessions (`agent/audio_mute.py`). Defaults to `True` (muted) — including on a
+    missing file, a corrupt file, a legacy token+base_url-only file, and when the
+    stored value under this key is present but not a real `bool` (e.g. the string
+    `"no"`, `0`, or `null`) — none of those count as "the user chose off," only a
+    real `False` does.
+    """
+    value = _read_config().get(_KEY_MT5_SOUNDS_MUTED)
+    return value if isinstance(value, bool) else True
+
+
+def save_mt5_sounds_muted(muted: bool) -> None:
+    """Persist the «Звуки MT5» preference, replacing whatever was stored before."""
+    data = _read_config()
+    data[_KEY_MT5_SOUNDS_MUTED] = bool(muted)
+    _write_config(data)
+
+
+def load_mt5_mute_pending() -> bool:
+    """
+    Whether a mute this program applied in a previous run may still be in effect in
+    Windows' per-app volume memory and should be undone even if this run never
+    re-classifies the session itself (see `agent/audio_mute.py`'s module docstring,
+    "WHO OWNS A MUTE"). Defaults to `False` on a missing file, a corrupt file, or a
+    non-`bool` stored value — the same rule as `load_mt5_sounds_muted` above.
+    """
+    value = _read_config().get(_KEY_MT5_MUTE_PENDING)
+    return value if isinstance(value, bool) else False
+
+
+def save_mt5_mute_pending(pending: bool) -> None:
+    """Persist the mute-pending marker, replacing whatever was stored before."""
+    data = _read_config()
+    data[_KEY_MT5_MUTE_PENDING] = bool(pending)
     _write_config(data)

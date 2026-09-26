@@ -74,3 +74,59 @@ def _never_touch_the_real_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     from agent import autostart
 
     monkeypatch.setattr(autostart, "_winreg", _RegistryAccessForbidden())
+
+
+@pytest.fixture(autouse=True)
+def _isolated_app_data(tmp_path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
+    """
+    AUTOUSE guard (quick 260926-ieo): points `agent.config_store.app_data_dir()` at a
+    per-test throwaway directory, via `APPDATA`, so no test in this whole suite can
+    ever read or write the developer's real `%APPDATA%\\TreedgerAgent\\config.json` —
+    a file that may hold a real, currently-valid pairing token. Any module-level
+    fixture that also sets `APPDATA` (e.g. `agent/tests/test_config_store.py`'s own
+    `_isolated_config_dir`) still wins for that module, because pytest applies a
+    module-scoped `autouse` fixture AFTER this session/conftest-level one runs first
+    for the same test, and `monkeypatch.setenv` simply overwrites the value again.
+    """
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    return tmp_path
+
+
+def _fail_on_real_core_audio() -> None:
+    pytest.fail("tests must never touch real Core Audio — pass a fake backend_factory")
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_real_core_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    AUTOUSE guard (quick 260926-ieo): `agent.audio_mute.MuteController`'s default
+    backend factory talks to the real Windows Core Audio API. Every test gets that
+    factory replaced with one that FAILS the test via `pytest.fail` — which raises a
+    `BaseException` subclass (`_pytest.outcomes.Failed`), not `Exception`, so
+    `MuteController`'s deliberately broad `except Exception` (it must never raise
+    into the UI) cannot swallow it and turn a real-Core-Audio-access bug into a
+    silent no-op. Tests that exercise `MuteController` pass their own fake
+    `backend_factory` explicitly, as the plan requires.
+    """
+    from agent import audio_mute
+
+    monkeypatch.setattr(audio_mute, "_default_backend_factory", lambda: _fail_on_real_core_audio())
+
+
+def _fail_on_real_tray_icon(*_args: object, **_kwargs: object) -> bool:
+    pytest.fail("tests must never create a real tray icon")
+
+
+@pytest.fixture(autouse=True)
+def _never_create_a_real_tray_icon(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    AUTOUSE guard (quick 260926-ieo): `agent.tray.TrayIcon.start()` spins up a real
+    Windows notification-area icon on its own background thread. No unit test in this
+    suite should ever do that — every test that exercises `TrayIcon` uses its pure
+    helpers (`menu_entries`, `clamp_text`, `notify_action`) or a fake sink, never a real
+    `start()`. `pytest.fail` raises a `BaseException` subclass, not `Exception`, so no
+    broad `except Exception` in this codebase can swallow it silently.
+    """
+    from agent import tray
+
+    monkeypatch.setattr(tray.TrayIcon, "start", _fail_on_real_tray_icon)

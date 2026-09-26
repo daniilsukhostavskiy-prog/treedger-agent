@@ -46,6 +46,13 @@ top of the one file where it matters:
     main thread. They only generate Tk's own <<Paste>>/<<Copy>>/<<Cut>>/<<SelectAll>>
     virtual events on the entry — the clipboard text never enters Python and is never
     logged.
+  - `agent/tray.py`'s `TrayIcon` (quick 260926-ieo) owns its OWN daemon thread — a
+    SECOND producer onto `self._queue`, alongside the sync worker thread. Its
+    `command_sink` (`AgentWindow.tray_command_sink`) runs ON THE TRAY THREAD and does
+    exactly one thing, like the worker's `report` callback: push a plain `_TrayCommand`
+    onto `self._queue`. It never touches a widget, never reads `self.state`, and never
+    calls `root.after` itself — `_poll_queue` is what turns a drained `_TrayCommand`
+    into `_handle_tray_command(...)` on the main thread.
 
 Do not "simplify" this by having the worker thread call a widget method directly,
 even for something that looks harmless (e.g. a one-line status update) — that is
@@ -60,15 +67,29 @@ administrator rights — quick 260925-qhs), `autostart.enable_autostart()` is
 reachable from exactly one place, the checkbox's own handler, and the silent
 startup self-check may only rewrite an already-existing value whose executable no
 longer exists, never create one. The installer's own «Запускать вместе с Windows»
-option writes the same value and is unchecked by default. No tray icon and no
-self-update check of any kind still hold — if a version notice is ever shown
-(the protocol-too-old notice below), it is plain text with a link the user
-follows themselves, never a download-and-execute path. This window also never
-kills the user's MT5 terminal process and never restores a session behind their
-back — it only warns. This program never notifies, never
-pops up, and never raises itself above other windows on its own — the site
-watches for a silent program (via the agent's own authenticated requests), not
-for this window to announce anything.
+option writes the same value and is unchecked by default. No self-update check of
+any kind still holds — if a version notice is ever shown (the protocol-too-old
+notice below), it is plain text with a link the user follows themselves, never a
+download-and-execute path.
+
+Since quick 260926-ieo, this window ALSO has a tray icon (`agent/tray.py`): closing
+the window with X hides it back to the tray (`_hide_to_tray`) rather than quitting —
+only the tray menu's «Выход» (`_quit`) ends the program — with the one exception that
+X quits exactly like before when no tray icon exists at all (the tray failed to
+start, or this is an older/manual-launch path), so the program can never become
+unreachable with neither a window nor a tray icon. The program notifies the user
+through a tray BALLOON only on a transition into one of exactly two problems (a
+login MT5 itself refused, or MetaTrader 5 not found) and only while the window is
+hidden — never for a routine sync, and never for anything else. This window still
+never raises itself above other windows on its own, except in direct response to the
+person's own action (a tray click/menu choice, or starting the program a second
+time) — the site still watches for a silent program via the agent's own
+authenticated requests, not for this window to announce anything on its own
+initiative. This window also STILL never kills the user's MT5 terminal process, never
+restores a session behind their back, and never shows, hides, minimises or
+reconfigures the terminal's own window — it only warns, and (since this quick task)
+mutes/unmutes the terminal's own Windows PER-APPLICATION audio sessions through
+`agent/audio_mute.py`, touching nothing else about the terminal.
 """
 from __future__ import annotations
 
@@ -95,14 +116,17 @@ except ImportError as exc:  # pragma: no cover - environment-specific; see READM
 
 from agent import (
     api_client,
+    audio_mute,
     autostart,
     config_store,
     constants,
     diagnostics,
+    errors,
     mt5_bridge,
     single_instance,
     sync,
     terminal_discovery,
+    tray,
     ui_state,
 )
 
@@ -111,6 +135,12 @@ logger = logging.getLogger(__name__)
 _POLL_INTERVAL_MS = 100
 _SYNC_INTERVAL_MS = constants.SYNC_INTERVAL_SECONDS * 1000
 _STARTUP_SYNC_DELAY_MS = constants.STARTUP_SYNC_DELAY_SECONDS * 1000
+
+# quick 260926-ieo — derived from agent/audio_mute.py's own cadence constants, never a
+# repeated literal (OR-8).
+_MUTE_FIRST_DELAY_MS = audio_mute.FIRST_APPLY_DELAY_SECONDS * 1000
+_MUTE_INTERVAL_MS = audio_mute.REAPPLY_INTERVAL_SECONDS * 1000
+_MUTE_FAST_INTERVAL_MS = audio_mute.REAPPLY_INTERVAL_DURING_SYNC_SECONDS * 1000
 
 # Windows virtual-key codes → Tk's clipboard virtual events (quick 260925-qhs, brief
 # E1). Tk binds <<Paste>> & co. to LATIN keysyms, so under the Russian layout Ctrl+V
@@ -172,6 +202,23 @@ class AgentWindow:
         # cross-thread object besides the queue.
         self._cancel_event: Optional[threading.Event] = None
 
+        # Tray + mute state (quick 260926-ieo). Deliberately NO tray creation, no
+        # Core Audio call, and no `root.withdraw()`/`deiconify()` here (F5) — a bare
+        # `AgentWindow.__new__` test window must be able to call every EXISTING method
+        # this __init__ already supported without gaining a new required attribute
+        # that method now reads. The tray itself is created and started in `main()`
+        # and handed in afterwards via `attach_tray`.
+        self._tray: "Optional[tray.TrayIcon]" = None
+        self._window_visible = False
+        self._sounds_muted = config_store.load_mt5_sounds_muted()
+        self._mute_pending = config_store.load_mt5_mute_pending()
+        # Lazy: does no COM work until its first apply()/restore() call.
+        self._mute = audio_mute.MuteController()
+        self._run_login_failures: "list[str]" = []
+        self._last_attention: "frozenset[str]" = frozenset()
+        self._last_tooltip: "Optional[str]" = None
+        self._quitting = False
+
         # Silent, log-only self-check — see repair_autostart_path()'s own docstring
         # for why this never surfaces a dialog: the person made no mistake, so there
         # is nothing to tell them. Runs on every start, regardless of whether
@@ -191,6 +238,10 @@ class AgentWindow:
         # One sync shortly after the window opens, however it was launched (quick
         # 260925-qhs — implements Phase 40 D-21's premise; never tied to --minimized).
         self.root.after(_STARTUP_SYNC_DELAY_MS, self._on_startup_sync)
+        # First MT5-sound reconcile shortly after the window opens (quick 260926-ieo,
+        # OR-8) — independent of `--minimized` and of the tray, exactly like the
+        # startup sync above; `_on_mute_tick` reschedules itself thereafter.
+        self._schedule_mute_tick(_MUTE_FIRST_DELAY_MS)
 
     # -----------------------------------------------------------------
     # Widget construction — built once. `_render()` only ever mutates these
@@ -319,7 +370,9 @@ class AgentWindow:
             for name in ui_state.STAGE_ORDER
         }
 
-        # In memory only — config_store never gains a third key for this.
+        # In memory only — never written to config.json (see config_store's own
+        # closed allow-list, which holds only the token, base URL and the two
+        # «Звуки MT5» booleans — this value is never one of them).
         self._last_success_var = tk.StringVar(value="")
         self._last_success_label = tk.Label(frame, textvariable=self._last_success_var, anchor="w")
         self._last_success_label.pack(anchor="w", padx=12, pady=(4, 0))
@@ -547,6 +600,11 @@ class AgentWindow:
         # the worker only ever reads it.
         cancel_event = threading.Event()
         self._cancel_event = cancel_event
+        # A fresh run's own login-failure tally (quick 260926-ieo, F13) — reassigned by
+        # value, on the main thread, before the worker exists, exactly like
+        # `_cancel_event` above; the worker only ever APPENDS to it via
+        # `_LoginFailedSignal` through the queue, never reads or clears it directly.
+        self._run_login_failures = []
         # The run-start marker goes through the reducer BEFORE the worker exists, so
         # the stage list and «Отменить» appear the instant the button is pressed.
         self._dispatch(ui_state.RunStartedEvent())
@@ -627,6 +685,14 @@ class AgentWindow:
                     algo_trading_allowed=getattr(progress, "algo_trading_allowed", None),
                 )
             )
+            # quick 260926-ieo, F13: a SECOND, separate queue item — this worker still
+            # touches only the queue (module docstring). "Login failed" means only
+            # `auth_failed` (MT5 itself refused the credentials); a transient
+            # `server_unavailable`/`timeout` never counts and never pushes this signal.
+            if progress.phase == sync.PHASE_FAILED and getattr(progress, "outcome", None) == (
+                errors.OUTCOME_AUTH_FAILED
+            ):
+                self._queue.put(_LoginFailedSignal(progress.mt_login))
 
         logger.info("sync run started")
         try:
@@ -718,6 +784,7 @@ class AgentWindow:
     def _dispatch(self, event: "ui_state.Event") -> None:
         self.state = ui_state.reduce(self.state, event)
         self._render()
+        self._refresh_tray_status()
 
     def _poll_queue(self) -> None:
         try:
@@ -725,6 +792,13 @@ class AgentWindow:
                 event = self._queue.get_nowait()
                 if isinstance(event, _SyncFinishedSentinel):
                     self._sync_in_flight = False
+                    self._evaluate_attention()
+                    continue
+                if isinstance(event, _TrayCommand):
+                    self._handle_tray_command(event.command)
+                    continue
+                if isinstance(event, _LoginFailedSignal):
+                    self._run_login_failures.append(event.mt_login or "?")
                     continue
                 self._dispatch(event)
         except queue.Empty:
@@ -796,15 +870,198 @@ class AgentWindow:
             self._on_refresh_clicked()
 
     # -----------------------------------------------------------------
+    # Tray + startup visibility (quick 260926-ieo). Everything below runs on the Tk
+    # main thread — `tray_command_sink` is the one exception, and it only enqueues.
+    # -----------------------------------------------------------------
+    @property
+    def sounds_muted(self) -> bool:
+        """Read-only accessor for `main()` — never reads the private attribute
+        directly from outside this class."""
+        return self._sounds_muted
+
+    def tray_command_sink(self, command: str) -> None:
+        """
+        The ONLY thing the tray thread is allowed to call on this window (see the
+        module docstring's CROSS-THREAD DISCIPLINE section) — it does nothing but
+        enqueue, exactly like the sync worker's own `report` callback.
+        """
+        self._queue.put(_TrayCommand(command))
+
+    def attach_tray(self, icon: "Optional[tray.TrayIcon]") -> None:
+        """Hands this window a STARTED tray icon (or `None`, when `tray.TrayIcon.start()`
+        itself failed) — called once from `main()`, after `AgentWindow.__init__`."""
+        self._tray = icon
+        if icon is not None:
+            icon.set_sounds_muted(self._sounds_muted)
+            tooltip = ui_state.tray_tooltip_text(self.state)
+            icon.set_tooltip(tooltip)
+            self._last_tooltip = tooltip
+
+    def show_initial(self, *, minimized: bool) -> None:
+        """
+        Decides the window's INITIAL visibility (OR-2/OR-3) — called once from
+        `main()`, after `attach_tray`. Stays hidden in the tray ONLY when ALL THREE
+        hold: `minimized` was requested, a tray icon is actually attached, and the
+        screen is not the pairing screen (an unpaired program has nothing useful to do
+        hidden — OR-3). Every other combination shows the window exactly as before this
+        quick task existed.
+        """
+        if minimized and self._tray is not None and self.state.screen != ui_state.SCREEN_PAIRING:
+            logger.info("started in the notification area (tray icon, no window)")
+        else:
+            self._show_window()
+        self._evaluate_attention()
+
+    def _show_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self._window_visible = True
+
+    def _hide_to_tray(self) -> None:
+        self.root.withdraw()
+        self._window_visible = False
+
+    def _handle_tray_command(self, command: str) -> None:
+        if command == tray.CMD_SYNC_NOW:
+            self._on_refresh_clicked()
+        elif command == tray.CMD_OPEN_WINDOW:
+            self._show_window()
+        elif command == tray.CMD_OPEN_SITE:
+            self._open_site()
+        elif command == tray.CMD_TOGGLE_SOUNDS:
+            self._on_sound_toggled()
+        elif command == tray.CMD_EXIT:
+            self._quit()
+        elif command == tray.CMD_TRAY_FAILED:
+            # NIM_ADD never succeeded even after two minutes of retries (agent/tray.py's
+            # own LOGON TIMING section) — the tray is treated as unavailable and the
+            # window is shown so the program never becomes unreachable.
+            self._tray = None
+            self._show_window()
+        else:
+            logger.warning("tray: unknown command %r", command)
+
+    def _open_site(self) -> None:
+        """«Открыть Treedger» — only ever a stored `https://`/`http://` base URL, or
+        the fixed default. Never a `file://` or otherwise unexpected scheme (T-ieo-06)."""
+        url = config_store.load_base_url() or ""
+        if not (url.startswith("https://") or url.startswith("http://")):
+            url = _DEFAULT_BASE_URL
+        webbrowser.open(url)
+
+    def _on_sound_toggled(self) -> None:
+        """The tray menu's «Звуки MT5» checkable item (OR-10/OR-11)."""
+        self._sounds_muted = not self._sounds_muted
+        try:
+            config_store.save_mt5_sounds_muted(self._sounds_muted)
+        except OSError:
+            logger.warning("failed to persist mt5_sounds_muted", exc_info=True)
+        if self._tray is not None:
+            self._tray.set_sounds_muted(self._sounds_muted)
+        self._reconcile_mt5_sound()
+
+    def _set_mute_pending(self, value: bool) -> None:
+        """Updates the in-memory flag FIRST (authoritative for this run — see
+        `agent/audio_mute.py`'s "WHO OWNS A MUTE"), then best-effort persists it."""
+        self._mute_pending = value
+        try:
+            config_store.save_mt5_mute_pending(value)
+        except OSError:
+            logger.warning("failed to persist mt5_mute_pending", exc_info=True)
+
+    def _reconcile_mt5_sound(self) -> None:
+        """One tick of the MT5-sound reconcile — called from `_on_mute_tick` and right
+        after a toggle. Never raises (see `_on_mute_tick`'s own wrapper too)."""
+        if self._sounds_muted:
+            result = self._mute.apply(adopt_already_muted=self._mute_pending)
+            if result.newly_muted > 0 and not self._mute_pending:
+                self._set_mute_pending(True)
+        elif self._mute_pending:
+            result = self._mute.restore(adopt_already_muted=True)
+            if result.terminal_sessions_seen > 0 and result.errors == 0:
+                self._set_mute_pending(False)
+        # else: sounds are on and nothing is pending — no controller call at all.
+
+    def _schedule_mute_tick(self, delay_ms: int) -> None:
+        self.root.after(delay_ms, self._on_mute_tick)
+
+    def _on_mute_tick(self) -> None:
+        try:
+            self._reconcile_mt5_sound()
+        except Exception:  # noqa: BLE001 — a tick must never crash the window
+            logger.exception("mute tick failed")
+        self._schedule_mute_tick(_MUTE_FAST_INTERVAL_MS if self._sync_in_flight else _MUTE_INTERVAL_MS)
+
+    def _refresh_tray_status(self) -> None:
+        if self._tray is None:
+            return
+        tooltip = ui_state.tray_tooltip_text(self.state)
+        if tooltip != self._last_tooltip:
+            self._tray.set_tooltip(tooltip)
+            self._last_tooltip = tooltip
+
+    def _evaluate_attention(self) -> None:
+        """
+        Balloons the tray ONLY on a fresh transition into one of the two named
+        problems (OR-6, F14), and ONLY while the window is hidden — a visible window
+        already shows the problem. Dedupe state (`_last_attention`) is updated
+        regardless of visibility, so a problem that first appears while the window is
+        open does not immediately balloon the moment the window is later hidden.
+        """
+        kinds = ui_state.attention_kinds(self.state, login_failed=bool(self._run_login_failures))
+        new_kinds = kinds - self._last_attention
+        self._last_attention = kinds
+        if not new_kinds or self._tray is None or self._window_visible:
+            return
+        for kind in new_kinds:
+            title, text = ui_state.attention_balloon(kind, mt_logins=tuple(self._run_login_failures))
+            self._tray.show_balloon(title, text)
+
+    # -----------------------------------------------------------------
     # Shutdown
     # -----------------------------------------------------------------
     def _on_close(self) -> None:
         """
-        Shuts the terminal CONNECTION down — never the terminal process itself —
-        so a run in flight does not leave the terminal attached after this window
-        closes. This never restores a previous session — this program never does
-        that, on any exit path.
+        WM_DELETE_WINDOW (the X button). With a tray icon attached, this only HIDES the
+        window (OR-4) — sync timers keep running, exactly as if the window had never
+        been closed. The program quits ONLY through `_quit()` (the tray's «Выход»), with
+        the one exception below.
         """
+        if self._tray is not None:
+            self._hide_to_tray()
+            return
+        # No tray icon exists (it failed to start, or this is an older/manual-launch
+        # path) — X must still quit, so the program can never become unreachable with
+        # neither a window nor a tray icon.
+        self._quit()
+
+    def _quit(self) -> None:
+        """
+        «Выход» (or X with no tray). Restores every session's own mute BEFORE tearing
+        anything else down, so a person who quits with sounds muted always gets MT5's
+        sounds back — each step is independently guarded so one failing step never
+        prevents `root.destroy()` from running. Guarded against a second call (e.g. a
+        double click) by `_quitting`.
+        """
+        if self._quitting:
+            return
+        self._quitting = True
+
+        if self._sounds_muted or self._mute_pending:
+            try:
+                result = self._mute.restore(adopt_already_muted=not self._sounds_muted)
+                if result.terminal_sessions_seen > 0 and result.errors == 0 and not self._mute.has_recorded():
+                    self._set_mute_pending(False)
+            except Exception:  # noqa: BLE001 — quitting must never get stuck here
+                logger.exception("mute restore on quit failed")
+
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("tray stop on quit failed")
+
         try:
             mt5_bridge.shutdown_terminal()
         finally:
@@ -823,17 +1080,45 @@ class _SyncFinishedSentinel:
 
 
 @dataclass(frozen=True)
+class _TrayCommand:
+    """
+    A plain, queue-only bookkeeping marker (quick 260926-ieo) — never a
+    `ui_state.Event`, exactly like `_SyncFinishedSentinel` above. Pushed by
+    `AgentWindow.tray_command_sink`, which runs ON THE TRAY THREAD and does nothing
+    else (see the module docstring's CROSS-THREAD DISCIPLINE section); `_poll_queue`
+    (main thread) is what turns it into a call to `_handle_tray_command`.
+    """
+
+    command: str
+
+
+@dataclass(frozen=True)
+class _LoginFailedSignal:
+    """
+    A plain, queue-only bookkeeping marker (quick 260926-ieo) — never a
+    `ui_state.Event`. Pushed by the sync worker thread's own `report` callback
+    alongside its normal `AccountProgressEvent`, exactly once per account whose login
+    MT5 itself refused (`outcome == errors.OUTCOME_AUTH_FAILED`, F13) — this is how
+    `_evaluate_attention` learns "a login failed this run" without `ui_state.UiState`
+    itself gaining a dedicated field for it.
+    """
+
+    mt_login: "Optional[str]"
+
+
+@dataclass(frozen=True)
 class WindowLaunchOptions:
     """
     The command line's ENTIRE contribution to how this window starts, and by design
     this dataclass must never carry more than that. `minimized` affects ONLY the
-    window's initial visual state (iconified vs. normal) — never "skip the
-    terminal check in background", never "behave differently while minimized",
-    never any second meaning. `agent/tests/test_main_args.py` asserts
-    `dataclasses.fields(WindowLaunchOptions)` has length 1 for exactly this
-    reason: a second field here is how that constraint erodes, one
-    plausible-looking addition at a time, and the moment a background mode exists
-    it will inevitably be tested worse than the foreground one — nobody watches
+    window's initial visual state — since quick 260926-ieo, hidden in the notification
+    area (no window, no taskbar button) vs. shown, where it previously meant iconified
+    vs. normal — never "skip the terminal check in background", never "behave
+    differently while minimized", never any second meaning.
+    `agent/tests/test_main_args.py` asserts `dataclasses.fields(WindowLaunchOptions)`
+    has length 1 for exactly this reason: a second field here is how that constraint
+    erodes, one plausible-looking addition at a time, and the moment a background mode
+    exists it will inevitably be tested worse than the foreground one — nobody watches
     the window that isn't shown.
 
     Deliberately carries NO string field, and never should. The token, the base
@@ -900,14 +1185,26 @@ def main() -> None:
     options = parse_argv(sys.argv[1:])
 
     root = tk.Tk()
+    # Withdrawn IMMEDIATELY after construction, before AgentWindow ever builds a
+    # widget — never mapped before the program itself decides to show it (quick
+    # 260926-ieo, OR-2). This is what makes an autostart launch produce no window and
+    # no taskbar button at all, rather than the old iconified-window behaviour.
+    root.withdraw()
     # Tk otherwise prints a callback's traceback to stderr, which a console-less
     # build does not have — route it into agent.log instead.
     root.report_callback_exception = diagnostics.log_tk_callback_exception
-    AgentWindow(root)
-    # Applied here, and nowhere else — see WindowLaunchOptions's own docstring for
-    # why this is the flag's only effect.
-    if options.minimized:
-        root.iconify()
+    window = AgentWindow(root)
+
+    icon = tray.TrayIcon(
+        window.tray_command_sink,
+        tooltip=ui_state.tray_tooltip_text(window.state),
+        sounds_muted=window.sounds_muted,
+    )
+    window.attach_tray(icon if icon.start() else None)
+    # Replaces the old `if options.minimized: root.iconify()` — see
+    # `AgentWindow.show_initial`'s own docstring for the exact visibility rule and
+    # `WindowLaunchOptions`'s docstring for why this remains the flag's only effect.
+    window.show_initial(minimized=options.minimized)
     root.mainloop()
 
 
